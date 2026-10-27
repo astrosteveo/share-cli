@@ -4,31 +4,40 @@
     share PATH [PATH ...]    upload, wait until the link works, print one link per file
     share --list             every file that is up, with its link
     share --rm TARGET ...    take files down (a link, a 10-character id or a file name)
+    share --setup            store Cloudflare R2 settings; from then on files go there
 
-Files go into a public GitHub repo of your own (default <you>/share, made on first use with
-`gh`) and GitHub Pages serves them at https://<you>.github.io/share/f/<id>/<name>. Pages sends the
-right content type, so a video plays in the browser and a picture opens in place, and your
-friends need no account. The id is the start of the file's SHA-256, so sharing the same file
-again gives the same link.
+Files go to one of two places. Both serve them at <base>/f/<id>/<name> with the right content
+type, so a video plays in the browser and a picture opens in place, and your friends need no
+account. The id is the start of the file's SHA-256, so sharing the same file again gives the same
+link.
+
+  * Cloudflare R2, once `share --setup` has stored its settings in ~/.config/share/r2.json. A
+    bucket behind your own domain serves a file the moment its upload ends. Up to 5 GB a file.
+  * Otherwise a public GitHub repo of your own (default <you>/share, made on first use with `gh`),
+    served by GitHub Pages at https://<you>.github.io/share/. A link works only once Pages has
+    deployed it, usually 15 to 25 seconds after the push, and this waits for it. Up to 100 MB a
+    file (git refuses more) and about 1 GB for the whole site. SHARE_BACKEND=github picks it even
+    when R2 is set up, and SHARE_REPO=owner/name picks another repo.
 
 Things to know:
-  * The repo is public. Anyone can browse it and open anything in it. Never share what you would
-    not post openly.
-  * A link works only once GitHub Pages has deployed it, usually 15 to 25 seconds after the push.
-    This waits for it. Several paths in one call make one deploy.
-  * Limits: 100 MB a file (git refuses more) and about 1 GB for the whole site.
+  * Anyone with a link can open the file, and anyone can browse the GitHub repo. Never share what
+    you would not post openly.
   * Browsers play mp4 (H.264) and webm inline; .mov, .mkv and .avi may download instead.
-  * --rm rewrites the repo into one fresh commit and force-pushes, so the file leaves the history
-    and stops counting toward the 1 GB. GitHub may still serve the old commit by its SHA until it
-    cleans up. Anything truly sensitive should not go up at all.
+  * --rm on R2 deletes the file at once, but Cloudflare's cache may serve it for up to an hour.
+    On GitHub it rewrites the repo into one fresh commit and force-pushes, so the file leaves the
+    history and stops counting toward the 1 GB, but GitHub may still serve the old commit by its
+    SHA until it cleans up. Anything truly sensitive should not go up at all.
 
 Links go to stdout, everything else to stderr, so `share clip.mp4 | wl-copy` works. On Wayland the
-links are also copied to the clipboard. Set SHARE_REPO=owner/name to use another repo.
+links are also copied to the clipboard.
 """
 
 import argparse
+import getpass
 import hashlib
+import hmac
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -40,10 +49,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from xml.etree import ElementTree
 
 sys.dont_write_bytecode = True
 
 MAX_BYTES = 100 * 1024 * 1024
+R2_MAX_BYTES = 5 * 1024**3 - 5 * 1024**2  # R2's limit for one upload
+R2_KEYS = ("endpoint", "bucket", "access_key_id", "secret_access_key", "public_url")
+# A link always names the same bytes, so caching is safe; the hour bounds how long a removed file lingers.
+R2_CACHE_CONTROL = "public, max-age=3600"
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 WARN_BYTES = 50 * 1024 * 1024
 BUILD_TIMEOUT = 180
 OTHER_VIDEO = {".mov", ".mkv", ".avi", ".wmv", ".flv"}
@@ -127,6 +142,59 @@ def clean_name(name):
     return stem + suffix
 
 
+def link(base, ident, name):
+    return "%sf/%s/%s" % (base, ident, urllib.parse.quote(name))
+
+
+def config_path():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "share" / "r2.json"
+
+
+def r2_config():
+    """The stored R2 settings, or None when there are none or SHARE_BACKEND=github asks for GitHub."""
+    path = config_path()
+    if os.environ.get("SHARE_BACKEND") == "github" or not path.exists():
+        return None
+    try:
+        config = json.loads(path.read_text())
+    except ValueError as error:
+        die("%s is not valid JSON (%s); run share --setup again" % (path, error))
+    missing = [key for key in R2_KEYS if not config.get(key)]
+    if missing:
+        die("%s has no %s; run share --setup again" % (path, ", ".join(missing)))
+    return config
+
+
+def canonical_query(query):
+    """A query string as SigV4 signs it, and so as it must be sent: names and values escaped, then sorted."""
+    escape = lambda text: urllib.parse.quote(text, safe="-_.~")
+    return "&".join("%s=%s" % pair for pair in sorted((escape(k), escape(v)) for k, v in query.items()))
+
+
+def sigv4(method, path, query, headers, payload_hash, key_id, secret, stamp, region="auto", service="s3"):
+    """The Authorization header for an AWS Signature Version 4 request, which is how R2's S3 API checks who asks.
+
+    `path` is already escaped, `headers` has lower-case names and holds host and x-amz-date, and
+    `stamp` is the x-amz-date value, such as 20150830T123600Z.
+    """
+    scope = "%s/%s/%s/aws4_request" % (stamp[:8], region, service)
+    names = sorted(headers)
+    canonical = "\n".join([
+        method,
+        path,
+        canonical_query(query),
+        "".join("%s:%s\n" % (name, " ".join(str(headers[name]).split())) for name in names),
+        ";".join(names),
+        payload_hash,
+    ])
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    key = ("AWS4" + secret).encode()
+    for part in (stamp[:8], region, service, "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    signature = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+    return "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s" % (key_id, scope, ";".join(names), signature)
+
+
 def gh_login():
     """The gh login, read from gh's own config when it is there, which saves a call to the API."""
     login = run(["gh", "config", "get", "-h", "github.com", "user"], check=False).stdout.strip()
@@ -153,7 +221,7 @@ class Site:
         self.branch = "main"
 
     def url(self, ident, name):
-        return "%sf/%s/%s" % (self.base, ident, urllib.parse.quote(name))
+        return link(self.base, ident, name)
 
     def api(self, path):
         """The JSON gh gets for an API path, or {} if the call fails, so a poll that misses an answer tries again."""
@@ -239,28 +307,157 @@ class Site:
             time.sleep(1)
         return False
 
-    def check_live(self, url):
-        """The content type if the link answers, else None. A few tries, because the CDN can lag a moment behind the build."""
-        for attempt in range(5):
-            try:
-                request = urllib.request.Request(url, method="HEAD")
-                with urllib.request.urlopen(request, timeout=15) as reply:
-                    return reply.headers.get("content-type", "")
-            except urllib.error.HTTPError as error:
-                if error.code != 404:
-                    return None
-            except urllib.error.URLError:
-                pass
-            time.sleep(2)
-        return None
-
     def files(self):
-        """Every file that is up, as (id, name, path), in name order."""
+        """Every file that is up, as (id, name, size), in name order."""
         found = []
         for path in sorted((self.clone / "f").glob("*/*")):
             if path.is_file():
-                found.append((path.parent.name, path.name, path))
+                found.append((path.parent.name, path.name, path.stat().st_size))
         return found
+
+    def upload(self, items, wait):
+        """Commits and pushes the files that are not up yet. False if `wait` and the deploy is still running after three minutes."""
+        added = []
+        for path, ident, name, _ in items:
+            target = self.clone / "f" / ident / name
+            if not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, target)
+                added.append(name)
+        if not added:
+            return True
+        say("uploading %s" % ", ".join(added))
+        git(self.clone, "add", "-A")
+        sha = self.commit_and_push(("add " + ", ".join(added))[:120])
+        return not wait or self.wait_for_build(sha)
+
+    def remove(self, doomed, wait):
+        """Takes these (id, name) files down, from the history too."""
+        for ident in sorted({ident for ident, _ in doomed}):
+            git(self.clone, "rm", "-rq", "f/" + ident)
+        # One fresh commit of what is left, so the removed bytes leave the branch history too.
+        git(self.clone, "checkout", "-q", "--orphan", "_rewrite")
+        git(self.clone, "commit", "-q", "-m", "share files")
+        git(self.clone, "branch", "-q", "-M", self.branch)
+        pushed = git(self.clone, "push", "-q", "-f", "origin", self.branch, check=False)
+        if pushed.returncode:
+            git(self.clone, "reset", "-q", "--hard", "origin/" + self.branch)
+            die("the push failed: %s" % pushed.stderr.strip())
+        sha = git(self.clone, "rev-parse", "HEAD").stdout.strip()
+        say("removed %d file(s) from the repo and its history" % len(doomed))
+        say("GitHub may serve the old commit by its SHA until it cleans up")
+        if wait:
+            self.wait_for_build(sha)
+
+
+class Bucket:
+    """A Cloudflare R2 bucket behind your own domain, reached with its S3 API. A file answers the moment its upload ends."""
+
+    def __init__(self, config):
+        self.host = urllib.parse.urlsplit(config["endpoint"]).netloc
+        self.bucket = config["bucket"]
+        self.key_id, self.secret = config["access_key_id"], config["secret_access_key"]
+        self.base = config["public_url"].rstrip("/") + "/"
+
+    def url(self, ident, name):
+        return link(self.base, ident, name)
+
+    def request(self, method, key="", query=None, body=None, digest=EMPTY_SHA256, headers=None):
+        """One signed request, as (status, body). A 404 comes back; any other failure ends the program with R2's reason."""
+        query = query or {}
+        path = "/" + self.bucket + ("/" + urllib.parse.quote(key) if key else "")
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        headers = dict(headers or {}, **{"host": self.host, "x-amz-content-sha256": digest, "x-amz-date": stamp})
+        headers["authorization"] = sigv4(method, path, query, headers, digest, self.key_id, self.secret, stamp)
+        del headers["host"]  # urllib sends it from the URL
+        url = "https://%s%s" % (self.host, path) + ("?" + canonical_query(query) if query else "")
+        try:
+            # With a file for the body and Content-Length set, urllib streams it rather than chunking it.
+            with urllib.request.urlopen(urllib.request.Request(url, data=body, method=method, headers=headers), timeout=60) as reply:
+                return reply.status, reply.read()
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return 404, b""
+            die("R2 refused %s %s: %s" % (method, key or "the bucket list", s3_reason(error)))
+        except urllib.error.URLError as error:
+            die("cannot reach R2 at %s: %s" % (self.host, error.reason))
+
+    def files(self):
+        """Every file that is up, as (id, name, size), in name order."""
+        found, query = [], {"list-type": "2", "prefix": "f/"}
+        while True:
+            status, body = self.request("GET", query=query)
+            if status == 404:
+                die("there is no bucket %s; make it in the Cloudflare dashboard" % self.bucket)
+            root = ElementTree.fromstring(body)
+            for element in root.iter():
+                element.tag = element.tag.rsplit("}", 1)[-1]  # drop the S3 namespace
+            for item in root.iter("Contents"):
+                parts = item.findtext("Key").split("/")
+                if len(parts) == 3:
+                    found.append((parts[1], parts[2], int(item.findtext("Size"))))
+            token = root.findtext("NextContinuationToken")
+            if root.findtext("IsTruncated") != "true" or not token:
+                return found
+            query = dict(query, **{"continuation-token": token})
+
+    def upload(self, items, wait):
+        """Puts each file that is not up yet. Always True: there is no build to wait for."""
+        for path, ident, name, digest in items:
+            key = "f/%s/%s" % (ident, name)
+            if self.request("HEAD", key)[0] == 404:
+                say("uploading %s" % name)
+                with open(path, "rb") as handle:
+                    self.request("PUT", key, body=handle, digest=digest, headers={
+                        "cache-control": R2_CACHE_CONTROL,
+                        "content-length": str(path.stat().st_size),
+                        "content-type": mimetypes.guess_type(name)[0] or "application/octet-stream",
+                    })
+        return True
+
+    def remove(self, doomed, wait):
+        """Takes these (id, name) files down."""
+        for ident, name in doomed:
+            self.request("DELETE", "f/%s/%s" % (ident, name))
+        say("removed %d file(s)" % len(doomed))
+        say("Cloudflare's cache may serve them for up to an hour")
+
+
+def s3_reason(error):
+    """R2's own words for a failed request, such as "SignatureDoesNotMatch: ...", or the HTTP status."""
+    try:
+        root = ElementTree.fromstring(error.read())
+    except ElementTree.ParseError:
+        root = None
+    if root is None or not root.findtext("Code"):
+        return "HTTP %d" % error.code
+    return "%s: %s" % (root.findtext("Code"), root.findtext("Message"))
+
+
+def open_store():
+    """Where the files go: the R2 bucket once it is set up, else the GitHub repo, synced."""
+    config = r2_config()
+    if config:
+        return Bucket(config)
+    site = Site()
+    site.sync()
+    return site
+
+
+def check_live(url):
+    """The content type if the link answers, else None. A few tries, because the CDN can lag a moment behind the build."""
+    for attempt in range(5):
+        try:
+            request = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(request, timeout=15) as reply:
+                return reply.headers.get("content-type", "")
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                return None
+        except urllib.error.URLError:
+            pass
+        time.sleep(2)
+    return None
 
 
 def copy_to_clipboard(text):
@@ -281,6 +478,7 @@ def finish(links, copy):
 
 
 def cmd_share(paths, wait, copy):
+    limit, rule = (R2_MAX_BYTES, "R2 takes at most 5 GB") if r2_config() else (MAX_BYTES, "GitHub takes at most 100 MB")
     items = []
     for raw in paths:
         path = Path(raw).expanduser()
@@ -289,57 +487,43 @@ def cmd_share(paths, wait, copy):
         size = path.stat().st_size
         if size == 0:
             die("%s is empty" % raw)
-        if size > MAX_BYTES:
-            die("%s is %s and GitHub takes at most 100 MB a file. Shrink it first, for example:\n"
-                "  ffmpeg -i %s -crf 28 -vf scale=-2:720 smaller.mp4" % (raw, human(size), raw))
+        if size > limit:
+            die("%s is %s and %s a file. Shrink it first, for example:\n"
+                "  ffmpeg -i %s -crf 28 -vf scale=-2:720 smaller.mp4" % (raw, human(size), rule, raw))
         if size > WARN_BYTES:
             say("note: %s is %s, which is big for a link" % (path.name, human(size)))
         if path.suffix.lower() in OTHER_VIDEO:
             say("note: browsers play mp4 (H.264) and webm inline; %s may download instead" % path.name)
-        items.append((path, sha256(path)[:10], clean_name(path.name)))
+        digest = sha256(path)
+        items.append((path, digest[:10], clean_name(path.name), digest))
 
-    site = Site()
-    site.sync()
-    added = []
-    for path, ident, name in items:
-        target = site.clone / "f" / ident / name
-        if not target.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, target)
-            added.append(name)
-    links = [site.url(ident, name) for _, ident, name in items]
-    if added:
-        say("uploading %s" % ", ".join(added))
-        git(site.clone, "add", "-A")
-        sha = site.commit_and_push(("add " + ", ".join(added))[:120])
-        if wait and not site.wait_for_build(sha):
-            say("share: the build is still running, so the links may not work for another minute")
-            finish(links, copy)
-            return
-    if wait:
-        for link in links:
-            kind = site.check_live(link)
+    store = open_store()
+    live = store.upload(items, wait)
+    links = [store.url(ident, name) for _, ident, name, _ in items]
+    if not live:
+        say("share: the build is still running, so the links may not work for another minute")
+    elif wait:
+        for each in links:
+            kind = check_live(each)
             if kind is None:
-                say("share: %s does not answer yet; try it again in a minute" % link)
+                say("share: %s does not answer yet; try it again in a minute" % each)
             else:
-                say("ok  %s  (%s)" % (link.rsplit("/", 1)[-1], kind.split(";")[0]))
+                say("ok  %s  (%s)" % (each.rsplit("/", 1)[-1], kind.split(";")[0]))
     finish(links, copy)
 
 
 def cmd_list():
-    site = Site()
-    site.sync()
-    found = site.files()
+    store = open_store()
+    found = store.files()
     if not found:
         say("nothing is up")
-    for ident, name, path in found:
-        print("%s  %8s  %s" % (site.url(ident, name), human(path.stat().st_size), ident))
+    for ident, name, size in found:
+        print("%s  %8s  %s" % (store.url(ident, name), human(size), ident))
 
 
 def cmd_rm(targets, wait):
-    site = Site()
-    site.sync()
-    found = site.files()
+    store = open_store()
+    found = store.files()
     ids = set()
     for target in targets:
         match = re.search(r"/f/([0-9a-f]{10})/", target)
@@ -348,21 +532,48 @@ def cmd_rm(targets, wait):
         if not hits:
             die("nothing that is up matches %s" % target)
         ids |= hits
-    for ident in sorted(ids):
-        git(site.clone, "rm", "-rq", "f/" + ident)
-    # One fresh commit of what is left, so the removed bytes leave the branch history too.
-    git(site.clone, "checkout", "-q", "--orphan", "_rewrite")
-    git(site.clone, "commit", "-q", "-m", "share files")
-    git(site.clone, "branch", "-q", "-M", site.branch)
-    pushed = git(site.clone, "push", "-q", "-f", "origin", site.branch, check=False)
-    if pushed.returncode:
-        git(site.clone, "reset", "-q", "--hard", "origin/" + site.branch)
-        die("the push failed: %s" % pushed.stderr.strip())
-    sha = git(site.clone, "rev-parse", "HEAD").stdout.strip()
-    say("removed %d file(s) from the repo and its history" % len(ids))
-    say("GitHub may serve the old commit by its SHA until it cleans up")
-    if wait:
-        site.wait_for_build(sha)
+    store.remove([(ident, name) for ident, name, _ in found if ident in ids], wait)
+
+
+def ask(prompt, default=""):
+    answer = input("%s%s: " % (prompt, " [%s]" % default if default else "")).strip() or default
+    if not answer:
+        die("setup needs this; run share --setup again")
+    return answer
+
+
+def cmd_setup():
+    """Asks for the R2 settings, checks them with one list of the bucket, then saves them where only you can read them."""
+    path = config_path()
+    try:
+        old = json.loads(path.read_text())
+    except (OSError, ValueError):
+        old = {}
+    say("Cloudflare R2 settings, from the R2 API token page. They go in %s, readable by you only." % path)
+    endpoint = ask("S3 endpoint, like https://<account id>.r2.cloudflarestorage.com", old.get("endpoint", ""))
+    parts = urllib.parse.urlsplit(endpoint if "://" in endpoint else "https://" + endpoint)
+    config = {"endpoint": "https://" + parts.netloc}
+    config["bucket"] = ask("Bucket", parts.path.strip("/").split("/")[0] or old.get("bucket", "share"))
+    config["access_key_id"] = ask("Access Key ID", old.get("access_key_id", ""))
+    secret = getpass.getpass("Secret Access Key (not shown%s): " % ("; Enter keeps the saved one" if old else "")).strip()
+    config["secret_access_key"] = secret or old.get("secret_access_key", "")
+    if not config["secret_access_key"]:
+        die("setup needs the secret; run share --setup again")
+    public = ask("Public URL, the bucket's custom domain, like https://share.example.com", old.get("public_url", ""))
+    config["public_url"] = (public if "://" in public else "https://" + public).rstrip("/")
+    found = Bucket(config).files()  # ends the program with R2's reason if a setting is wrong
+    say("R2 answered: %d file(s) in %s" % (len(found), config["bucket"]))
+    try:
+        urllib.request.urlopen(urllib.request.Request(config["public_url"], method="HEAD"), timeout=15)
+    except urllib.error.HTTPError:
+        pass  # any answer means the domain and its certificate work
+    except urllib.error.URLError as error:
+        say("note: %s does not answer yet (%s); check that the custom domain is Active" % (config["public_url"], error.reason))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+        json.dump(config, handle, indent=2)
+    os.chmod(path, 0o600)
+    say("saved; `share FILE` now puts files on %s" % config["public_url"])
 
 
 def main():
@@ -373,10 +584,13 @@ def main():
     parser.add_argument("paths", nargs="*", metavar="PATH", help="files to put on the web")
     parser.add_argument("--list", action="store_true", help="list what is up, with links")
     parser.add_argument("--rm", nargs="+", metavar="TARGET", help="take files down: a link, an id or a file name")
+    parser.add_argument("--setup", action="store_true", help="store Cloudflare R2 settings; from then on files go there")
     parser.add_argument("--no-wait", action="store_true", help="print the links without waiting for the Pages build")
     parser.add_argument("--no-copy", action="store_true", help="leave the clipboard alone")
     args = parser.parse_args()
-    if args.list:
+    if args.setup:
+        cmd_setup()
+    elif args.list:
         cmd_list()
     elif args.rm:
         cmd_rm(args.rm, not args.no_wait)

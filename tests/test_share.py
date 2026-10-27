@@ -1,8 +1,11 @@
-"""Tests for the parts of `share` that need no network: names, sizes, the checks before an upload and the wait."""
+"""Tests for the parts of `share` that need no network: names, sizes, the checks before an upload,
+the R2 settings and signing, and the wait for Pages."""
 
 import hashlib
 import importlib.machinery
 import importlib.util
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +15,35 @@ ROOT = Path(__file__).resolve().parents[1]
 loader = importlib.machinery.SourceFileLoader("share", str(ROOT / "share"))
 share = importlib.util.module_from_spec(importlib.util.spec_from_loader("share", loader))
 loader.exec_module(share)
+
+CONFIG = {
+    "endpoint": "https://acct.r2.cloudflarestorage.com",
+    "bucket": "share",
+    "access_key_id": "key",
+    "secret_access_key": "secret",
+    "public_url": "https://share.example.com",
+}
+
+
+def setUpModule():
+    # Point the config at an empty folder, so no test can read real R2 settings and upload with them.
+    global config_home, environment
+    config_home = tempfile.TemporaryDirectory()
+    environment = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config_home.name})
+    environment.start()
+    os.environ.pop("SHARE_BACKEND", None)
+
+
+def tearDownModule():
+    environment.stop()
+    config_home.cleanup()
+
+
+def write_config(config):
+    path = share.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config))
+    return path
 
 
 class CleanName(unittest.TestCase):
@@ -70,6 +102,140 @@ class RefusesBeforeUploading(unittest.TestCase):
             with open(big, "wb") as handle:
                 handle.truncate(share.MAX_BYTES + 1)  # sparse, so it costs no disk
             self.refused(big)
+
+    def test_a_file_over_5_gb_when_r2_is_set_up(self):
+        write_config(CONFIG)
+        self.addCleanup(share.config_path().unlink)
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp) / "big.mp4"
+            with open(big, "wb") as handle:
+                handle.truncate(share.R2_MAX_BYTES + 1)
+            self.refused(big)
+
+
+class R2Config(unittest.TestCase):
+    def tearDown(self):
+        share.config_path().unlink(missing_ok=True)
+
+    def test_none_without_a_file(self):
+        self.assertIsNone(share.r2_config())
+
+    def test_the_stored_settings(self):
+        write_config(CONFIG)
+        self.assertEqual(share.r2_config(), CONFIG)
+
+    def test_share_backend_github_ignores_them(self):
+        write_config(CONFIG)
+        with mock.patch.dict(os.environ, {"SHARE_BACKEND": "github"}):
+            self.assertIsNone(share.r2_config())
+
+    def test_a_missing_setting_stops_the_program(self):
+        write_config(dict(CONFIG, secret_access_key=""))
+        with self.assertRaises(SystemExit):
+            share.r2_config()
+
+
+class Setup(unittest.TestCase):
+    def tearDown(self):
+        share.config_path().unlink(missing_ok=True)
+
+    def setup(self, answers, secret, files=()):
+        with mock.patch("builtins.input", side_effect=answers), \
+                mock.patch.object(share.getpass, "getpass", return_value=secret), \
+                mock.patch.object(share.Bucket, "files", return_value=list(files)), \
+                mock.patch.object(share.urllib.request, "urlopen"), \
+                mock.patch.object(share, "say"):
+            share.cmd_setup()
+        return json.loads(share.config_path().read_text())
+
+    def test_saves_the_settings_for_your_eyes_only(self):
+        saved = self.setup(["https://acct.r2.cloudflarestorage.com/share", "", "key", "share.example.com"], "secret")
+        self.assertEqual(saved, CONFIG)
+        self.assertEqual(share.config_path().stat().st_mode & 0o777, 0o600)
+
+    def test_enter_keeps_the_saved_secret(self):
+        write_config(CONFIG)
+        saved = self.setup(["", "", "", ""], "")
+        self.assertEqual(saved, CONFIG)
+
+    def test_bad_settings_are_not_saved(self):
+        with mock.patch("builtins.input", side_effect=["acct.r2.cloudflarestorage.com", "share", "key", "x.example.com"]), \
+                mock.patch.object(share.getpass, "getpass", return_value="wrong"), \
+                mock.patch.object(share.Bucket, "files", side_effect=SystemExit(1)), \
+                mock.patch.object(share, "say"):
+            with self.assertRaises(SystemExit):
+                share.cmd_setup()
+        self.assertFalse(share.config_path().exists())
+
+
+class Sigv4(unittest.TestCase):
+    """Cases from AWS's SigV4 test suite, as kept in botocore's tests/unit/auth/aws4_testsuite."""
+
+    def sign(self, method, path, query):
+        headers = {"host": "example.amazonaws.com", "x-amz-date": "20150830T123600Z"}
+        return share.sigv4(method, path, query, headers, share.EMPTY_SHA256, "AKIDEXAMPLE",
+                           "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20150830T123600Z", "us-east-1", "service")
+
+    def expect(self, signature):
+        return ("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/service/aws4_request, "
+                "SignedHeaders=host;x-amz-date, Signature=" + signature)
+
+    def test_get_vanilla_query_order_key_case(self):
+        self.assertEqual(self.sign("GET", "/", {"Param2": "value2", "Param1": "value1"}),
+                         self.expect("b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500"))
+
+    def test_get_unreserved(self):
+        path = "/-._~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        self.assertEqual(self.sign("GET", path, {}),
+                         self.expect("07ef7494c76fa4850883e2b006601f940f8a34d404d0cfa977f52a65bbf5f24f"))
+
+    def test_post_vanilla_query(self):
+        self.assertEqual(self.sign("POST", "/", {"Param1": "value1"}),
+                         self.expect("28038455d6de14eafc1f9222cf5aa6f1a96197d7deb8263271d420d138af7f11"))
+
+    def test_a_slash_in_a_query_value_is_escaped(self):
+        self.assertEqual(share.canonical_query({"prefix": "f/", "list-type": "2"}), "list-type=2&prefix=f%2F")
+
+
+class Bucket(unittest.TestCase):
+    """The bucket's requests are stubbed: these check what it asks for and how it reads the answers."""
+
+    def bucket(self, *replies):
+        bucket = share.Bucket(CONFIG)
+        bucket.request = mock.Mock(side_effect=list(replies))
+        return bucket
+
+    def page(self, keys, token=None):
+        items = "".join("<Contents><Key>%s</Key><Size>%d</Size></Contents>" % (key, size) for key, size in keys)
+        more = "<IsTruncated>true</IsTruncated><NextContinuationToken>%s</NextContinuationToken>" % token if token else ""
+        return 200, ('<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">%s%s</ListBucketResult>' % (items, more)).encode()
+
+    def test_files_reads_every_page(self):
+        bucket = self.bucket(self.page([("f/aaaaaaaaaa/a.png", 10)], token="next"), self.page([("f/bbbbbbbbbb/b.mp4", 20)]))
+        self.assertEqual(bucket.files(), [("aaaaaaaaaa", "a.png", 10), ("bbbbbbbbbb", "b.mp4", 20)])
+        self.assertEqual(bucket.request.call_args.kwargs["query"]["continuation-token"], "next")
+
+    def test_files_skips_keys_outside_the_layout(self):
+        self.assertEqual(self.bucket(self.page([("f/stray.txt", 1)])).files(), [])
+
+    def test_upload_puts_only_what_is_not_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            new, old = Path(tmp) / "clip.mp4", Path(tmp) / "pic.png"
+            new.write_bytes(b"video")
+            old.write_bytes(b"picture")
+            bucket = self.bucket((404, b""), (200, b""), (200, b""))
+            with mock.patch.object(share, "say"):
+                bucket.upload([(new, "aaaaaaaaaa", "clip.mp4", "d1"), (old, "bbbbbbbbbb", "pic.png", "d2")], wait=True)
+        put = bucket.request.call_args_list[1]
+        self.assertEqual(put.args, ("PUT", "f/aaaaaaaaaa/clip.mp4"))
+        self.assertEqual(put.kwargs["digest"], "d1")
+        self.assertEqual(put.kwargs["headers"]["content-type"], "video/mp4")
+        self.assertEqual(put.kwargs["headers"]["content-length"], "5")
+        self.assertEqual(bucket.request.call_args_list[2].args, ("HEAD", "f/bbbbbbbbbb/pic.png"))
+        self.assertEqual(bucket.request.call_count, 3)
+
+    def test_links_use_the_public_url(self):
+        self.assertEqual(share.Bucket(CONFIG).url("aaaaaaaaaa", "a.png"), "https://share.example.com/f/aaaaaaaaaa/a.png")
 
 
 class Workflow(unittest.TestCase):
