@@ -14,9 +14,9 @@ again gives the same link.
 Things to know:
   * The repo is public. Anyone can browse it and open anything in it. Never share what you would
     not post openly.
-  * A link works only after GitHub's Pages build, about 40 seconds. This waits for it.
-  * Limits: 100 MB a file (git refuses more), about 1 GB for the whole site, and about 10 Pages
-    builds an hour. Several paths in one call make one build.
+  * A link works only once GitHub Pages has deployed it, usually 15 to 25 seconds after the push.
+    This waits for it. Several paths in one call make one deploy.
+  * Limits: 100 MB a file (git refuses more) and about 1 GB for the whole site.
   * Browsers play mp4 (H.264) and webm inline; .mov, .mkv and .avi may download instead.
   * --rm rewrites the repo into one fresh commit and force-pushes, so the file leaves the history
     and stops counting toward the 1 GB. GitHub may still serve the old commit by its SHA until it
@@ -51,6 +51,39 @@ README = (
     "# share\n\nPictures and videos shared by link with the `share` command.\n\n"
     "This repo is public: everything in `f/` can be browsed and opened by anyone.\n"
 )
+# Pages' own branch build is two jobs, and the second waits for a fresh runner. One job saves about 7 s.
+WORKFLOW_PATH = ".github/workflows/pages.yml"
+WORKFLOW = """\
+# Written by the `share` command: deploy the repo as it is, in one job.
+name: pages
+on:
+  push:
+    branches: [%s]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v5
+        with:
+          reporting_interval: 1000
+"""
+DEPLOY_FAILED = {"deployment_failed", "deployment_content_failed", "deployment_attempt_error", "deployment_lost"}
 
 
 def say(message):
@@ -94,6 +127,12 @@ def clean_name(name):
     return stem + suffix
 
 
+def gh_login():
+    """The gh login, read from gh's own config when it is there, which saves a call to the API."""
+    login = run(["gh", "config", "get", "-h", "github.com", "user"], check=False).stdout.strip()
+    return login or run(["gh", "api", "user", "--jq", ".login"]).stdout.strip()
+
+
 def sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -106,8 +145,7 @@ class Site:
     """The clone of the share repo and the Pages site built from it."""
 
     def __init__(self):
-        login = run(["gh", "api", "user", "--jq", ".login"]).stdout.strip()
-        self.repo = os.environ.get("SHARE_REPO") or "%s/share" % login
+        self.repo = os.environ.get("SHARE_REPO") or "%s/share" % gh_login()
         self.owner, self.name = self.repo.split("/")
         cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
         self.clone = cache / "share" / self.name
@@ -117,8 +155,16 @@ class Site:
     def url(self, ident, name):
         return "%sf/%s/%s" % (self.base, ident, urllib.parse.quote(name))
 
+    def api(self, path):
+        """The JSON gh gets for an API path, or {} if the call fails, so a poll that misses an answer tries again."""
+        done = run(["gh", "api", path], check=False)
+        try:
+            return json.loads(done.stdout or "{}")
+        except ValueError:
+            return {}
+
     def sync(self):
-        """Makes the local clone match the remote, making the repo, its Pages site and `.nojekyll` the first time."""
+        """Makes the local clone match the remote, making the repo and its Pages site the first time."""
         if not (self.clone / ".git").is_dir():
             if run(["gh", "repo", "view", self.repo], check=False).returncode:
                 say("making the public repo %s (first use)" % self.repo)
@@ -130,42 +176,67 @@ class Site:
         head = git(self.clone, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False).stdout.strip()
         self.branch = head.split("/", 1)[1] if "/" in head else "main"
         git(self.clone, "checkout", "-q", "-f", "-B", self.branch, "origin/" + self.branch)
-        if run(["gh", "api", "repos/%s/pages" % self.repo], check=False).returncode:
-            say("turning on GitHub Pages")
-            run(["gh", "api", "-X", "POST", "repos/%s/pages" % self.repo, "-f", "source[branch]=" + self.branch, "-f", "source[path]=/"])
-        # Without this, Pages' Jekyll build skips any file whose name starts with `_` or `.`.
+        # The workflow is the last thing set up, so once it is in the repo there is nothing to check.
+        if not (self.clone / WORKFLOW_PATH).exists():
+            self.set_up_pages()
+
+    def set_up_pages(self):
+        """Has Pages deploy with the one-job workflow: on first use, and once for a repo made when `share` used the branch build."""
+        say("setting up GitHub Pages to deploy in one job (once)")
+        # Without this, a branch build's Jekyll skips any file whose name starts with `_` or `.`.
         if not (self.clone / ".nojekyll").exists():
             (self.clone / ".nojekyll").write_text("")
             (self.clone / "README.md").write_text(README)
-            git(self.clone, "add", "-A")
-            self.commit_and_push("serve every file as it is")
+        workflow = self.clone / WORKFLOW_PATH
+        workflow.parent.mkdir(parents=True, exist_ok=True)
+        workflow.write_text(WORKFLOW % self.branch)
+        git(self.clone, "add", "-A")
+        endpoint = ["gh", "api", "repos/%s/pages" % self.repo]
+        pages = run(endpoint, check=False)
+        undo = None
+        if pages.returncode:
+            run(endpoint + ["-X", "POST", "-f", "build_type=workflow"])
+        elif json.loads(pages.stdout).get("build_type") != "workflow":
+            # Back to the branch build if the push fails, or nothing would deploy until the workflow lands.
+            undo = lambda: run(endpoint + ["-X", "PUT", "-f", "build_type=legacy"], check=False)
+            run(endpoint + ["-X", "PUT", "-f", "build_type=workflow"])
+        self.commit_and_push("deploy every file as it is, in one job", undo)
 
-    def commit_and_push(self, message):
-        """One commit, pushed; if the push fails the clone goes back to the remote so it is never left ahead."""
+    def commit_and_push(self, message, undo=None):
+        """One commit, pushed; if the push fails the clone goes back to the remote so it is never left ahead, and `undo` runs."""
         git(self.clone, "commit", "-q", "-m", message)
         pushed = git(self.clone, "push", "-q", "origin", "HEAD:" + self.branch, check=False)
         if pushed.returncode:
             git(self.clone, "reset", "-q", "--hard", "origin/" + self.branch)
+            if undo:
+                undo()
             die("the push failed: %s" % pushed.stderr.strip())
         return git(self.clone, "rev-parse", "HEAD").stdout.strip()
 
     def wait_for_build(self, sha):
-        """Waits for the Pages build of this commit. True when it is built, False if it is not after three minutes."""
-        say("waiting for GitHub Pages to build...")
+        """Waits for Pages to deploy this commit. True when it is live, False if it is not after three minutes."""
+        say("waiting for GitHub Pages to deploy...")
         started = time.time()
+        polls = 0
         while time.time() - started < BUILD_TIMEOUT:
-            done = run(["gh", "api", "repos/%s/pages/builds/latest" % self.repo], check=False)
-            try:
-                build = json.loads(done.stdout or "{}")
-            except ValueError:
-                build = {}
-            if build.get("commit") == sha:
-                if build.get("status") == "built":
-                    say("built in %d s" % (time.time() - started))
-                    return True
-                if build.get("status") == "errored":
-                    die("the Pages build failed: %s" % (build.get("error") or {}).get("message", "no reason given"))
-            time.sleep(3)
+            # "succeed" comes after the CDN is purged, so the link answers at once.
+            status = self.api("repos/%s/pages/deployments/%s" % (self.repo, sha)).get("status")
+            if status == "succeed":
+                say("live in %d s" % (time.time() - started))
+                return True
+            if status in DEPLOY_FAILED:
+                die("the Pages deploy failed (%s)" % status)
+            polls += 1
+            # A run that fails before it deploys never shows above, so look at the run now and then.
+            if polls % 5 == 0:
+                runs = self.api("repos/%s/actions/runs?head_sha=%s" % (self.repo, sha)).get("workflow_runs") or []
+                for done in runs:
+                    # A newer push took its place, and that build has these files too.
+                    if done.get("conclusion") == "cancelled":
+                        return False
+                    if done.get("status") == "completed" and done.get("conclusion") != "success":
+                        die("the Pages run ended with %s: %s" % (done.get("conclusion"), done.get("html_url")))
+            time.sleep(1)
         return False
 
     def check_live(self, url):
