@@ -59,6 +59,8 @@ R2_KEYS = ("endpoint", "bucket", "access_key_id", "secret_access_key", "public_u
 # A link always names the same bytes, so caching is safe; the hour bounds how long a removed file lingers.
 R2_CACHE_CONTROL = "public, max-age=3600"
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+# Cloudflare answers urllib's own "Python-urllib" agent with a 403, so the link checks say who they are.
+USER_AGENT = {"User-Agent": "share-cli"}
 WARN_BYTES = 50 * 1024 * 1024
 BUILD_TIMEOUT = 180
 OTHER_VIDEO = {".mov", ".mkv", ".avi", ".wmv", ".flv"}
@@ -448,7 +450,7 @@ def check_live(url):
     """The content type if the link answers, else None. A few tries, because the CDN can lag a moment behind the build."""
     for attempt in range(5):
         try:
-            request = urllib.request.Request(url, method="HEAD")
+            request = urllib.request.Request(url, method="HEAD", headers=USER_AGENT)
             with urllib.request.urlopen(request, timeout=15) as reply:
                 return reply.headers.get("content-type", "")
         except urllib.error.HTTPError as error:
@@ -564,7 +566,7 @@ def cmd_setup():
     found = Bucket(config).files()  # ends the program with R2's reason if a setting is wrong
     say("R2 answered: %d file(s) in %s" % (len(found), config["bucket"]))
     try:
-        urllib.request.urlopen(urllib.request.Request(config["public_url"], method="HEAD"), timeout=15)
+        urllib.request.urlopen(urllib.request.Request(config["public_url"], method="HEAD", headers=USER_AGENT), timeout=15)
     except urllib.error.HTTPError:
         pass  # any answer means the domain and its certificate work
     except urllib.error.URLError as error:

@@ -28,7 +28,9 @@ You need a domain on Cloudflare. In the Cloudflare dashboard:
 1. **R2 → Create bucket**, named `share`.
 2. **The bucket → Settings → Custom Domains → Connect Domain**, such as `share.example.com`. Wait
    until it shows Active; Cloudflare makes the DNS record and the certificate.
-3. **R2 → Manage API Tokens → Create API token**, with **Object Read & Write** on that bucket only.
+3. **R2 object storage → Overview → API Tokens: Manage → Create Account API token**, with
+   **Object Read & Write** on that bucket only. The next page shows the S3 endpoint, the Access
+   Key ID and the Secret Access Key; the secret is shown only once.
 
 Then run `share --setup` in a terminal and give it the S3 endpoint, the Access Key ID and the
 Secret Access Key from the token page, and the custom domain. It checks them with one list of the
@@ -68,8 +70,10 @@ run; that one run is slow, because two deploys run back to back. The local clone
 
 ## Where the time goes
 
-**R2:** there is no build. The time is the upload itself, plus one request to ask whether the file
-is there and one to check the public link.
+**R2:** there is no build. A new 1 MB picture takes under 1 s, from start to a link that answers:
+one request asks whether the file is there, one puts it, and one checks the public link. A bigger
+file adds only its upload time: a 51 MB clip took 5.1 s on an 85 Mbit/s uplink. Re-sharing a file
+that is up takes under 1 s.
 
 **GitHub:** a new upload usually takes 17 to 23 s, and now and then over 30 s. Nearly all of that is
 the Pages deploy, which `share` waits for so the link works the moment it prints. The rest
@@ -89,7 +93,9 @@ test), and one fetched just before the purge could outlast it.
 ## Limits
 
 **R2:** 5 GB a file (one upload). Anyone with a link can open the file, but nobody can browse the
-bucket. `--rm` deletes at once; Cloudflare's cache may serve the file for up to an hour after.
+bucket. `--rm` deletes at once, but Cloudflare's cache may serve the file for up to an hour after,
+and a browser that opened it may keep it for up to 4 hours (the zone's Browser Cache TTL, which
+Cloudflare uses when it is longer than the file's own hour).
 
 **GitHub:** 100 MB a file (git refuses more) and about 1 GB for the whole site. Pages' limit of 10
 builds an hour does not apply to a site deployed by its own workflow. The repo is public: anyone
