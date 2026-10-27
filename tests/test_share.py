@@ -4,6 +4,7 @@ the R2 settings and signing, and the wait for Pages."""
 import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import tempfile
@@ -176,17 +177,22 @@ class Setup(unittest.TestCase):
         return json.loads(share.config_path().read_text())
 
     def test_saves_the_settings_for_your_eyes_only(self):
-        saved = self.setup(["https://acct.r2.cloudflarestorage.com/share", "", "key", "share.example.com"], "secret")
+        saved = self.setup(["https://acct.r2.cloudflarestorage.com/share", "", "key", "share.example.com", ""], "secret")
         self.assertEqual(saved, CONFIG)
         self.assertEqual(share.config_path().stat().st_mode & 0o777, 0o600)
 
     def test_enter_keeps_the_saved_secret(self):
         write_config(CONFIG)
-        saved = self.setup(["", "", "", ""], "")
+        saved = self.setup(["", "", "", "", ""], "")
         self.assertEqual(saved, CONFIG)
 
+    def test_enter_keeps_the_saved_purge_settings(self):
+        write_config(dict(CONFIG, zone_id="zone", purge_token="tok"))
+        saved = self.setup(["", "", "", "", ""], "")
+        self.assertEqual(saved, dict(CONFIG, zone_id="zone", purge_token="tok"))
+
     def test_bad_settings_are_not_saved(self):
-        with mock.patch("builtins.input", side_effect=["acct.r2.cloudflarestorage.com", "share", "key", "x.example.com"]), \
+        with mock.patch("builtins.input", side_effect=["acct.r2.cloudflarestorage.com", "share", "key", "x.example.com", ""]), \
                 mock.patch.object(share.getpass, "getpass", return_value="wrong"), \
                 mock.patch.object(share.Bucket, "files", side_effect=SystemExit(1)), \
                 mock.patch.object(share, "say"):
@@ -263,6 +269,55 @@ class Bucket(unittest.TestCase):
 
     def test_links_use_the_public_url(self):
         self.assertEqual(share.Bucket(CONFIG).url("aaaaaaaaaa", "a.png"), "https://share.example.com/f/aaaaaaaaaa/a.png")
+
+
+class Purge(unittest.TestCase):
+    """--rm on R2 deletes, then asks Cloudflare to drop the links from its cache; the calls are stubbed."""
+
+    def remove(self, config, count, purge_error=None):
+        bucket = share.Bucket(config)
+        bucket.request = mock.Mock(return_value=(204, b""))
+        said = []
+        with mock.patch.object(share.urllib.request, "urlopen", side_effect=purge_error) as urlopen, \
+                mock.patch.object(share, "say", side_effect=said.append):
+            bucket.remove([("%010d" % i, "f%d.png" % i) for i in range(count)], wait=True)
+        return bucket, urlopen, said
+
+    def test_without_a_token_nothing_is_purged(self):
+        bucket, urlopen, said = self.remove(CONFIG, 2)
+        self.assertEqual(bucket.request.call_count, 2)
+        urlopen.assert_not_called()
+        self.assertIn("up to an hour", said[-1])
+
+    def test_the_removed_links_are_purged_30_at_a_time(self):
+        bucket, urlopen, said = self.remove(dict(CONFIG, zone_id="zone", purge_token="tok"), 31)
+        self.assertEqual(urlopen.call_count, 2)
+        first = urlopen.call_args_list[0].args[0]
+        self.assertEqual(first.full_url, "https://api.cloudflare.com/client/v4/zones/zone/purge_cache")
+        self.assertEqual(first.get_header("Authorization"), "Bearer tok")
+        files = json.loads(first.data)["files"]
+        self.assertEqual(len(files), 30)
+        self.assertEqual(files[0], "https://share.example.com/f/0000000000/f0.png")
+        self.assertIn("purged", said[-1])
+
+    def test_new_uploads_are_purged_so_a_cached_404_goes(self):
+        bucket = share.Bucket(dict(CONFIG, zone_id="zone", purge_token="tok"))
+        bucket.request = mock.Mock(side_effect=[(404, b""), (200, b""), (200, b"")])
+        bucket.purge = mock.Mock(return_value=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            new, old = Path(tmp) / "new.png", Path(tmp) / "old.png"
+            new.write_bytes(b"n")
+            old.write_bytes(b"o")
+            with mock.patch.object(share, "say"):
+                bucket.upload([(new, "aaaaaaaaaa", "new.png", "d1"), (old, "bbbbbbbbbb", "old.png", "d2")], wait=True)
+        bucket.purge.assert_called_once_with(["https://share.example.com/f/aaaaaaaaaa/new.png"])
+
+    def test_a_refused_purge_only_warns(self):
+        error = share.urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(
+            b'{"success": false, "errors": [{"code": 10000, "message": "Authentication error"}]}'))
+        bucket, urlopen, said = self.remove(dict(CONFIG, zone_id="zone", purge_token="tok"), 1, purge_error=error)
+        self.assertIn("10000 Authentication error", said[-2])
+        self.assertIn("up to an hour", said[-1])
 
 
 class Workflow(unittest.TestCase):
