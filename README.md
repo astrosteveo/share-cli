@@ -64,3 +64,7 @@ python3 -m unittest discover -s tests -v
 
 They cover name cleaning, size messages and the checks that run before anything is uploaded. None
 of them touch the network.
+
+## Licence
+
+MIT. See `LICENSE`.
