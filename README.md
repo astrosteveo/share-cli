@@ -36,6 +36,10 @@ Then run `share --setup` in a terminal and give it the S3 endpoint, the Access K
 Secret Access Key from the token page, and the custom domain. It checks them with one list of the
 bucket and saves them in `~/.config/share/r2.json`, readable by you only.
 
+Optionally, so that `--rm` takes a link down at once, make one more token: **Manage Account →
+Account API Tokens → Create Token**, with **Zone → Cache Purge** on your domain's zone. Give it and
+the zone's ID (on the domain's Overview page) to `share --setup`.
+
 R2's free tier (10 GB stored, 1 million uploads and 10 million reads a month, no charge for
 downloads) covers sharing clips with friends.
 
@@ -58,7 +62,9 @@ link.
 Version 4, so it needs no SDK. It asks whether `f/<id>/<name>` is there, puts it if not, and
 checks the public link once. Files are served with `Cache-Control: public, max-age=3600`: a link
 always names the same bytes, and the hour bounds how long Cloudflare's cache serves a file after
-`--rm`. Pictures, video, sound and PDFs keep their own type. Any other file that reads as UTF-8
+`--rm` when there is no purge token. With one, `--rm` purges the removed links, and an upload
+purges the new ones, because Cloudflare also caches a 404 and would otherwise keep a file shared
+again after `--rm` dead for a few minutes. Pictures, video, sound and PDFs keep their own type. Any other file that reads as UTF-8
 text, such as Markdown, code or HTML, is served as plain text, so every browser shows it instead
 of downloading it, and an HTML file never runs as a page on your domain.
 
@@ -72,8 +78,9 @@ run; that one run is slow, because two deploys run back to back. The local clone
 
 ## Where the time goes
 
-**R2:** there is no build. A new 1 MB picture takes under 1 s, from start to a link that answers:
-one request asks whether the file is there, one puts it, and one checks the public link. A bigger
+**R2:** there is no build. A new 1 MB picture takes about 0.9 s, from start to a link that
+answers: one request asks whether the file is there, one puts it, and one checks the public link.
+The cache purge, when set up, adds about 0.35 s. A bigger
 file adds only its upload time: a 51 MB clip took 5.1 s on an 85 Mbit/s uplink. Re-sharing a file
 that is up takes under 1 s.
 
@@ -95,9 +102,10 @@ test), and one fetched just before the purge could outlast it.
 ## Limits
 
 **R2:** 5 GB a file (one upload). Anyone with a link can open the file, but nobody can browse the
-bucket. `--rm` deletes at once, but Cloudflare's cache may serve the file for up to an hour after,
-and a browser that opened it may keep it for up to 4 hours (the zone's Browser Cache TTL, which
-Cloudflare uses when it is longer than the file's own hour).
+bucket. `--rm` deletes at once; with a purge token Cloudflare stops serving the file at once too,
+and without one its cache may serve it for up to an hour. Either way, a browser that opened it may
+keep it for up to 4 hours (the zone's Browser Cache TTL, which Cloudflare uses when it is longer
+than the file's own hour).
 
 **GitHub:** 100 MB a file (git refuses more) and about 1 GB for the whole site. Pages' limit of 10
 builds an hour does not apply to a site deployed by its own workflow. The repo is public: anyone

@@ -23,7 +23,9 @@ Things to know:
   * Anyone with a link can open the file, and anyone can browse the GitHub repo. Never share what
     you would not post openly.
   * Browsers play mp4 (H.264) and webm inline; .mov, .mkv and .avi may download instead.
-  * --rm on R2 deletes the file at once, but Cloudflare's cache may serve it for up to an hour.
+  * --rm on R2 deletes the file at once. With a Cache Purge token in the settings it also clears
+    Cloudflare's cache, so the link stops working at once; without one the cache may serve the file
+    for up to an hour. A browser that already opened it may keep showing it either way.
     On GitHub it rewrites the repo into one fresh commit and force-pushes, so the file leaves the
     history and stops counting toward the 1 GB, but GitHub may still serve the old commit by its
     SHA until it cleans up. Anything truly sensitive should not go up at all.
@@ -377,9 +379,27 @@ class Bucket:
         self.bucket = config["bucket"]
         self.key_id, self.secret = config["access_key_id"], config["secret_access_key"]
         self.base = config["public_url"].rstrip("/") + "/"
+        self.zone_id, self.purge_token = config.get("zone_id"), config.get("purge_token")
 
     def url(self, ident, name):
         return link(self.base, ident, name)
+
+    def purge(self, urls):
+        """Drops these links from Cloudflare's cache. True if it did; a failure only warns, as the files are gone already."""
+        for start in range(0, len(urls), 30):  # Cloudflare takes at most 30 links a call
+            request = urllib.request.Request(
+                "https://api.cloudflare.com/client/v4/zones/%s/purge_cache" % self.zone_id, method="POST",
+                data=json.dumps({"files": urls[start:start + 30]}).encode(),
+                headers=dict(USER_AGENT, **{"Authorization": "Bearer " + self.purge_token, "Content-Type": "application/json"}))
+            try:
+                urllib.request.urlopen(request, timeout=30).close()
+            except urllib.error.HTTPError as error:
+                say("share: Cloudflare would not purge its cache (%s)" % cloudflare_reason(error))
+                return False
+            except urllib.error.URLError as error:
+                say("share: cannot reach Cloudflare to purge its cache: %s" % error.reason)
+                return False
+        return True
 
     def request(self, method, key="", query=None, body=None, digest=EMPTY_SHA256, headers=None):
         """One signed request, as (status, body). A 404 comes back; any other failure ends the program with R2's reason."""
@@ -422,6 +442,7 @@ class Bucket:
 
     def upload(self, items, wait):
         """Puts each file that is not up yet. Always True: there is no build to wait for."""
+        added = []
         for path, ident, name, digest in items:
             key = "f/%s/%s" % (ident, name)
             if self.request("HEAD", key)[0] == 404:
@@ -432,6 +453,10 @@ class Bucket:
                         "content-length": str(path.stat().st_size),
                         "content-type": content_type(path, name),
                     })
+                added.append(self.url(ident, name))
+        # Cloudflare caches a 404 too, so a file shared again after --rm would answer 404 for a few minutes.
+        if added and self.zone_id and self.purge_token:
+            self.purge(added)
         return True
 
     def remove(self, doomed, wait):
@@ -439,7 +464,19 @@ class Bucket:
         for ident, name in doomed:
             self.request("DELETE", "f/%s/%s" % (ident, name))
         say("removed %d file(s)" % len(doomed))
-        say("Cloudflare's cache may serve them for up to an hour")
+        if self.zone_id and self.purge_token and self.purge([self.url(ident, name) for ident, name in doomed]):
+            say("and purged from Cloudflare's cache; a browser that already opened one may still show it")
+        else:
+            say("Cloudflare's cache may serve them for up to an hour")
+
+
+def cloudflare_reason(error):
+    """The Cloudflare API's own words for a failed call, or the HTTP status."""
+    try:
+        errors = json.loads(error.read()).get("errors") or []
+    except ValueError:
+        errors = []
+    return "; ".join("%s %s" % (e.get("code"), e.get("message")) for e in errors) or "HTTP %d" % error.code
 
 
 def s3_reason(error):
@@ -580,6 +617,12 @@ def cmd_setup():
         die("setup needs the secret; run share --setup again")
     public = ask("Public URL, the bucket's custom domain, like https://share.example.com", old.get("public_url", ""))
     config["public_url"] = (public if "://" in public else "https://" + public).rstrip("/")
+    say("Optional: a Cloudflare API token with Cache Purge on the domain's zone lets --rm clear the cache at once.")
+    zone = input("Zone ID, from the domain's Overview page (Enter %s): " % ("keeps the saved one" if old.get("zone_id") else "skips")).strip()
+    zone = zone or old.get("zone_id", "")
+    if zone:
+        token = getpass.getpass("Cache Purge token (not shown; Enter keeps the saved one): ").strip()
+        config["zone_id"], config["purge_token"] = zone, token or old.get("purge_token", "")
     found = Bucket(config).files()  # ends the program with R2's reason if a setting is wrong
     say("R2 answered: %d file(s) in %s" % (len(found), config["bucket"]))
     try:
