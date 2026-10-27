@@ -33,6 +33,7 @@ links are also copied to the clipboard.
 """
 
 import argparse
+import codecs
 import getpass
 import hashlib
 import hmac
@@ -165,6 +166,22 @@ def r2_config():
     if missing:
         die("%s has no %s; run share --setup again" % (path, ", ".join(missing)))
     return config
+
+
+def content_type(path, name):
+    """The type R2 serves a file as. Pictures, video, sound and PDFs keep their own. Any other file that
+    reads as UTF-8 text is plain text, so a browser shows it rather than saving it, and never runs it as
+    a web page."""
+    guessed = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    if guessed.split("/")[0] in ("image", "video", "audio") or guessed == "application/pdf":
+        return guessed
+    with open(path, "rb") as handle:
+        head = handle.read(64 * 1024)
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(head)  # not final, so a character cut at the end passes
+    except UnicodeDecodeError:
+        return guessed
+    return guessed if b"\0" in head else "text/plain; charset=utf-8"
 
 
 def canonical_query(query):
@@ -413,7 +430,7 @@ class Bucket:
                     self.request("PUT", key, body=handle, digest=digest, headers={
                         "cache-control": R2_CACHE_CONTROL,
                         "content-length": str(path.stat().st_size),
-                        "content-type": mimetypes.guess_type(name)[0] or "application/octet-stream",
+                        "content-type": content_type(path, name),
                     })
         return True
 

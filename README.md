@@ -58,7 +58,9 @@ link.
 Version 4, so it needs no SDK. It asks whether `f/<id>/<name>` is there, puts it if not, and
 checks the public link once. Files are served with `Cache-Control: public, max-age=3600`: a link
 always names the same bytes, and the hour bounds how long Cloudflare's cache serves a file after
-`--rm`.
+`--rm`. Pictures, video, sound and PDFs keep their own type. Any other file that reads as UTF-8
+text, such as Markdown, code or HTML, is served as plain text, so every browser shows it instead
+of downloading it, and an HTML file never runs as a page on your domain.
 
 **GitHub.** Files go into a public repo of your own, `<you>/share`, made on first use, and
 GitHub Pages serves it at `https://<you>.github.io/share/`. (Release assets were tried first and

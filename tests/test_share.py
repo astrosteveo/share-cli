@@ -113,6 +113,33 @@ class RefusesBeforeUploading(unittest.TestCase):
             self.refused(big)
 
 
+class ContentType(unittest.TestCase):
+    def kind(self, name, data):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / name
+            path.write_bytes(data)
+            return share.content_type(path, name)
+
+    def test_markdown_is_shown_as_plain_text(self):
+        self.assertEqual(self.kind("README.md", b"# hi\n"), "text/plain; charset=utf-8")
+
+    def test_code_python_guesses_wrong_is_plain_text(self):
+        self.assertEqual(self.kind("main.rs", b"fn main() {}\n"), "text/plain; charset=utf-8")
+
+    def test_html_is_shown_not_run(self):
+        self.assertEqual(self.kind("page.html", b"<script>alert(1)</script>"), "text/plain; charset=utf-8")
+
+    def test_a_character_cut_at_the_end_of_the_sample_is_still_text(self):
+        self.assertEqual(self.kind("notes.txt", b"a" * (64 * 1024 - 1) + "é".encode()), "text/plain; charset=utf-8")
+
+    def test_pictures_and_video_keep_their_type(self):
+        self.assertEqual(self.kind("pic.svg", b"<svg/>"), "image/svg+xml")
+        self.assertEqual(self.kind("clip.mp4", b"\0\0\0 ftyp"), "video/mp4")
+
+    def test_binary_is_not_text(self):
+        self.assertEqual(self.kind("blob.bin", b"\x00\xff\xfe"), "application/octet-stream")
+
+
 class R2Config(unittest.TestCase):
     def tearDown(self):
         share.config_path().unlink(missing_ok=True)
