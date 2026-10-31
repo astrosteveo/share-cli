@@ -490,6 +490,190 @@ class Expire(unittest.TestCase):
         self.assertEqual(share.r2_config()["expire_days"], [7])
 
 
+def segment(marker, payload):
+    return bytes([0xFF, marker]) + (len(payload) + 2).to_bytes(2, "big") + payload
+
+
+def exif(orientation, order="MM"):
+    pack = (lambda f, *v: __import__("struct").pack((">" if order == "MM" else "<") + f, *v))
+    tiff = order.encode() + pack("H", 42) + pack("I", 8) + pack("H", 2) + \
+        pack("HHII", 0x010F, 2, 6, 38) + pack("HHIHH", 0x0112, 3, 1, orientation, 0) + pack("I", 0) + b"Apple\0"
+    return segment(0xE1, b"Exif\0\0" + tiff)
+
+
+class StripJpeg(unittest.TestCase):
+    """The JPEG stripping used without exiftool, on a JPEG built by hand: every kind of segment, a scan with stuffed
+    bytes and a restart marker, and a second picture after the end, as some phones add."""
+
+    JFIF, ICC = segment(0xE0, b"JFIF\0\1\1"), segment(0xE2, b"ICC_PROFILE\0\1\1profile")
+    TABLES = segment(0xDB, b"\0" + bytes(64)) + segment(0xC0, b"\x08\0\x10\0\x10\x01\x01\x11\0")
+    SCAN = segment(0xDA, b"\x01\x01\0\0\x3f\0") + b"\x12\xff\x00\x34\xff\xd0\x56"
+
+    def picture(self, *metadata):
+        return b"\xff\xd8" + self.JFIF + b"".join(metadata) + self.ICC + self.TABLES + self.SCAN + b"\xff\xd9"
+
+    def test_metadata_goes_and_the_picture_stays(self):
+        dirty = self.picture(exif(1), segment(0xE1, b"http://ns.adobe.com/xap/1.0/\0<x:creator>Steve"),
+                             segment(0xED, b"Photoshop 3.0\0iptc"), segment(0xEB, b"JP\0c2pa"), segment(0xFE, b"a comment"),
+                             segment(0xE2, b"MPF\0index")) + b"\xff\xd8second picture with its own Exif\xff\xd9"
+        self.assertEqual(share.strip_jpeg(dirty), self.picture())
+
+    def test_the_orientation_survives_in_a_small_exif_of_its_own(self):
+        for order in ("MM", "II"):
+            clean = share.strip_jpeg(self.picture(exif(6, order)))
+            self.assertNotIn(b"Apple", clean)
+            self.assertTrue(clean.startswith(b"\xff\xd8" + self.JFIF + b"\xff\xe1"))
+            self.assertEqual(share.exif_orientation(clean[len(self.JFIF) + 2 + 10:]), 6)
+
+    def test_not_a_jpeg(self):
+        with self.assertRaises(ValueError):
+            share.strip_jpeg(b"GIF89a")
+
+
+class StripPng(unittest.TestCase):
+    @staticmethod
+    def chunk(kind, data):
+        import zlib
+        return len(data).to_bytes(4, "big") + kind + data + zlib.crc32(kind + data).to_bytes(4, "big")
+
+    def test_text_dates_and_exif_go_and_the_picture_and_its_profile_stay(self):
+        keep = [self.chunk(b"IHDR", bytes(13)), self.chunk(b"iCCP", b"icc\0\0data"), self.chunk(b"IDAT", b"pixels"),
+                self.chunk(b"IEND", b"")]
+        drop = [self.chunk(b"tEXt", b"Comment\0where"), self.chunk(b"eXIf", b"MM\0*"), self.chunk(b"tIME", bytes(7)),
+                self.chunk(b"iTXt", b"XML:com.adobe.xmp\0\0\0\0\0xmp")]
+        dirty = share.PNG_SIGNATURE + keep[0] + drop[0] + keep[1] + drop[1] + drop[2] + keep[2] + drop[3] + keep[3]
+        self.assertEqual(share.strip_png(dirty), share.PNG_SIGNATURE + b"".join(keep))
+
+
+class StripMetadata(unittest.TestCase):
+    def strip(self, name, data, exiftool=False):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path, folder = Path(tmp.name) / name, Path(tmp.name) / "out"
+        path.write_bytes(data)
+        folder.mkdir()
+        said = []
+        with mock.patch.object(share, "exiftool_writes", return_value={".jpg", ".mov"} if exiftool else set()), \
+                mock.patch.object(share, "run") as run, mock.patch.object(share, "say", side_effect=said.append), \
+                mock.patch.object(share.shutil, "which", return_value="/usr/bin/exiftool" if exiftool else None):
+            run.side_effect = lambda cmd, check: (Path(cmd[-2]).write_bytes(b"clean"), mock.Mock(returncode=0))[1]
+            out = share.strip_metadata(path, folder)
+        return path, out, run, said
+
+    def test_exiftool_strips_what_it_can_write_and_keeps_orientation_and_colour(self):
+        path, out, run, _ = self.strip("clip.mov", b"video", exiftool=True)
+        self.assertEqual(out.read_bytes(), b"clean")
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["exiftool", "-q", "-q"])
+        for kept in ("--icc_profile:all", "-orientation", "-colorspacetags"):
+            self.assertIn(kept, command)
+
+    def test_without_exiftool_a_jpeg_is_stripped_here(self):
+        path, out, run, _ = self.strip("pic.jpg", StripJpeg().picture(exif(1)))
+        run.assert_not_called()
+        self.assertEqual(out.read_bytes(), StripJpeg().picture())
+
+    def test_what_cannot_be_stripped_goes_up_as_it_is_with_a_note(self):
+        path, out, _, said = self.strip("pic.heic", b"heic")
+        self.assertEqual(out, path)
+        self.assertIn("install exiftool", said[0])
+
+    def test_files_that_are_not_pictures_or_video_are_left_alone(self):
+        for name in ("notes.md", "logo.svg"):
+            path, out, run, _ = self.strip(name, b"<svg/>")
+            self.assertEqual(out, path)
+            run.assert_not_called()
+
+
+class Inputs(unittest.TestCase):
+    """`-` reads stdin, and no path at all reads the Wayland clipboard."""
+
+    def test_piped_bytes_get_an_extension_from_how_they_start(self):
+        self.assertEqual(share.sniff_suffix(share.PNG_SIGNATURE + b"..."), ".png")
+        self.assertEqual(share.sniff_suffix(b"\xff\xd8\xff\xe0"), ".jpg")
+        self.assertEqual(share.sniff_suffix(b"\0\0\0\x20ftypisom"), ".mp4")
+        self.assertEqual(share.sniff_suffix(b"\0\0\0\x14ftypqt  "), ".mov")
+        self.assertEqual(share.sniff_suffix(b"RIFF\0\0\0\0WEBPVP8 "), ".webp")
+        self.assertEqual(share.sniff_suffix("# notes, café".encode()), ".txt")
+        self.assertEqual(share.sniff_suffix(b"\x00\x01\x02"), ".bin")
+
+    def clipboard(self, types, contents):
+        def paste(cmd, **kwargs):
+            if "--list-types" in cmd:
+                return mock.Mock(stdout="\n".join(types))
+            kind = cmd[cmd.index("--type") + 1]
+            if "stdout" in kwargs:
+                kwargs["stdout"].write(contents[kind])
+                return mock.Mock()
+            return mock.Mock(stdout=contents[kind])
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-1"}), \
+                mock.patch.object(share.shutil, "which", return_value="/usr/bin/wl-paste"), \
+                mock.patch.object(share.subprocess, "run", side_effect=paste):
+            return share.from_clipboard(Path(tmp.name))
+
+    def test_a_picture_on_the_clipboard_becomes_a_file(self):
+        [path] = self.clipboard(["text/html", "image/jpeg", "image/png"], {"image/png": b"\x89PNG data"})
+        self.assertRegex(path.name, r"^pasted-\d{8}-\d{6}\.png$")
+        self.assertEqual(path.read_bytes(), b"\x89PNG data")
+
+    def test_files_copied_in_a_file_manager_are_shared_by_path(self):
+        paths = self.clipboard(["text/uri-list", "image/png"],
+                               {"text/uri-list": "file:///home/me/My%20Clip.mp4\r\nfile:///home/me/a.png\r\n"})
+        self.assertEqual(paths, [Path("/home/me/My Clip.mp4"), Path("/home/me/a.png")])
+
+    def test_text_on_the_clipboard_is_not_shared(self):
+        self.assertEqual(self.clipboard(["text/plain"], {}), [])
+
+    def test_no_wayland_no_clipboard(self):
+        with mock.patch.dict(os.environ, {"WAYLAND_DISPLAY": ""}):
+            self.assertEqual(share.from_clipboard(Path("/nowhere")), [])
+
+
+class Mp4(unittest.TestCase):
+    """--mp4 asks ffprobe what a video holds and converts only what browsers may not play."""
+
+    def convert(self, name, streams):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / name
+        path.write_bytes(b"v")
+        process = mock.Mock(stdout=iter(["out_time_us=1000000\n"]), stderr=io.StringIO(""))
+        process.wait.return_value = 0
+        with mock.patch.object(share.shutil, "which", return_value="/usr/bin/ffmpeg"), \
+                mock.patch.object(share, "probe", return_value={"streams": streams, "format": {"duration": "2"}}), \
+                mock.patch.object(share.subprocess, "Popen", return_value=process) as popen, mock.patch.object(share, "say"):
+            out = share.to_mp4(path, Path(tmp.name))
+        return out, popen.call_args.args[0] if popen.called else None
+
+    H264 = {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"}
+    HEVC = {"codec_type": "video", "codec_name": "hevc", "pix_fmt": "yuv420p10le"}
+    AAC, PCM = {"codec_type": "audio", "codec_name": "aac"}, {"codec_type": "audio", "codec_name": "pcm_s16le"}
+
+    def test_an_mp4_that_plays_is_left_alone(self):
+        self.assertEqual(self.convert("a.mp4", [self.H264, self.AAC]), (None, None))
+
+    def test_webm_and_pictures_are_left_alone(self):
+        self.assertEqual(self.convert("a.webm", [self.HEVC]), (None, None))
+        self.assertEqual(self.convert("a.png", []), (None, None))
+
+    def test_a_mov_that_plays_has_its_video_copied_and_its_sound_made_aac(self):
+        out, command = self.convert("phone.mov", [self.H264, self.PCM])
+        self.assertEqual(out.name, "phone.mp4")
+        self.assertEqual(command[command.index("-c:v") + 1], "copy")
+        self.assertEqual(command[command.index("-c:a") + 1], "aac")
+        self.assertIn("+faststart", command)
+        self.assertEqual(command[command.index("-map_metadata") + 1], "-1")
+
+    def test_hevc_is_encoded_to_h264_at_an_even_size(self):
+        out, command = self.convert("clip.mkv", [self.HEVC, self.AAC])
+        self.assertEqual(command[command.index("-c:v") + 1], "libx264")
+        self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv420p")
+        self.assertIn("scale=trunc(iw/2)*2:trunc(ih/2)*2", command)
+        self.assertEqual(command[command.index("-c:a") + 1], "copy")
+
+
 class Workflow(unittest.TestCase):
     def test_the_branch_goes_in_and_the_expressions_survive(self):
         text = share.WORKFLOW % "trunk"
