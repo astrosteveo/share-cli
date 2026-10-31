@@ -12,7 +12,8 @@ account. The id is the start of the file's SHA-256, so sharing the same file aga
 link.
 
   * Cloudflare R2, once `share --setup` has stored its settings in ~/.config/share/r2.json. A
-    bucket behind your own domain serves a file the moment its upload ends. Up to 5 GB a file.
+    bucket behind your own domain serves a file the moment its upload ends. Up to 5 TB a file; one
+    over 100 MB goes up in parts, and if the connection drops, the next run goes on from the last part.
   * Otherwise a public GitHub repo of your own (default <you>/share, made on first use with `gh`),
     served by GitHub Pages at https://<you>.github.io/share/. A link works only once Pages has
     deployed it, usually 15 to 25 seconds after the push, and this waits for it. Up to 100 MB a
@@ -40,6 +41,7 @@ import codecs
 import getpass
 import hashlib
 import hmac
+import http.client
 import json
 import mimetypes
 import os
@@ -47,19 +49,26 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from xml.etree import ElementTree
 
 sys.dont_write_bytecode = True
 
 MAX_BYTES = 100 * 1024 * 1024
-R2_MAX_BYTES = 5 * 1024**3 - 5 * 1024**2  # R2's limit for one upload
+R2_MAX_BYTES = 5 * 1024**4  # R2's limit for one file, put up in parts
+MULTIPART_BYTES = 100 * 1024 * 1024  # bigger files go up in parts, so a dropped connection costs one part
+PART_BYTES = 16 * 1024 * 1024
+MAX_PARTS = 10000
+PROGRESS_BYTES = 8 * 1024 * 1024  # smaller uploads end before a progress line would help
+WORKERS = 4  # files put up, or links checked, at once
 R2_KEYS = ("endpoint", "bucket", "access_key_id", "secret_access_key", "public_url")
 # A link always names the same bytes, so caching is safe; the hour bounds how long a removed file lingers.
 R2_CACHE_CONTROL = "public, max-age=3600"
@@ -133,11 +142,11 @@ def git(clone, *args, check=True):
 
 
 def human(size):
-    for unit in ("B", "KB", "MB"):
+    for unit in ("B", "KB", "MB", "GB"):
         if size < 1024:
             return "%d %s" % (size, unit) if unit == "B" else "%.1f %s" % (size, unit)
         size /= 1024
-    return "%.1f GB" % size
+    return "%.1f TB" % size
 
 
 def clean_name(name):
@@ -255,11 +264,88 @@ def gh_login():
     return login or run(["gh", "api", "user", "--jq", ".login"]).stdout.strip()
 
 
-def sha256(path):
+# Set on Ctrl-C, so the uploads still going stop at their next read rather than run to the end.
+stopping = threading.Event()
+
+
+def in_parallel(work, things):
+    """`work` on each of `things`, a few at a time, as a list in the same order. A die() in one ends the program."""
+    pool = ThreadPoolExecutor(WORKERS)
+    try:
+        return list(pool.map(work, things))
+    except BaseException:
+        stopping.set()
+        raise
+    finally:
+        pool.shutdown(cancel_futures=True)
+
+
+class Progress:
+    """One line on stderr with how much of an upload has gone, for uploads big enough to wait on."""
+
+    def __init__(self, total):
+        self.total, self.done = total, 0
+        self.show = total >= PROGRESS_BYTES and sys.stderr.isatty()
+        self.started = self.shown = time.time()
+        self.lock = threading.Lock()
+
+    def add(self, count):
+        with self.lock:
+            self.done += count
+            now = time.time()
+            if self.show and now - self.shown >= 0.25:
+                self.shown = now
+                rate = self.done / max(now - self.started, 0.001)
+                sys.stderr.write("\r%3d%%  %s of %s  %s/s\033[K" % (
+                    100 * self.done // self.total, human(self.done), human(self.total), human(rate)))
+                sys.stderr.flush()
+
+    def end(self):
+        if self.show:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+
+class Slice:
+    """`length` bytes of a file from `offset`, read as a request body, counted on `progress` as they go.
+    rewind() starts it again for a retry."""
+
+    def __init__(self, path, offset, length, progress):
+        self.handle = open(path, "rb")
+        self.offset, self.length, self.progress = offset, length, progress
+        self.rewind()
+
+    def rewind(self):
+        if getattr(self, "sent", 0):
+            self.progress.add(-self.sent)
+        self.handle.seek(self.offset)
+        self.left, self.sent = self.length, 0
+
+    def read(self, size=-1):
+        if stopping.is_set():
+            raise KeyboardInterrupt
+        data = self.handle.read(self.left if size < 0 else min(size, self.left))
+        self.left -= len(data)
+        self.sent += len(data)
+        self.progress.add(len(data))
+        return data
+
+    def close(self):
+        self.handle.close()
+
+
+def file_sha256(path, offset=0, length=None):
+    """The SHA-256 of `length` bytes of a file from `offset`, or of all of it."""
     digest = hashlib.sha256()
+    left = os.path.getsize(path) - offset if length is None else length
     with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
+        handle.seek(offset)
+        while left > 0:
+            chunk = handle.read(min(1 << 20, left))
+            if not chunk:
+                break
             digest.update(chunk)
+            left -= len(chunk)
     return digest.hexdigest()
 
 
@@ -441,31 +527,42 @@ class Bucket:
                 return False
         return True
 
-    def request(self, method, key="", query=None, body=None, digest=EMPTY_SHA256, headers=None):
-        """One signed request, as (status, body). A 404 comes back; any other failure ends the program with R2's reason."""
+    def request(self, method, key="", query=None, body=None, digest=EMPTY_SHA256, headers=None, tries=3):
+        """One signed request, as (status, body, headers). A 404 comes back. A dropped connection or an error on
+        R2's side is tried again, up to `tries` times in all; any other failure ends the program with R2's reason."""
         query = query or {}
         path = "/" + self.bucket + ("/" + urllib.parse.quote(key) if key else "")
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        headers = dict(headers or {}, **{"host": self.host, "x-amz-content-sha256": digest, "x-amz-date": stamp})
-        headers["authorization"] = sigv4(method, path, query, headers, digest, self.key_id, self.secret, stamp)
-        del headers["host"]  # urllib sends it from the URL
         url = "https://%s%s" % (self.host, path) + ("?" + canonical_query(query) if query else "")
-        try:
-            # With a file for the body and Content-Length set, urllib streams it rather than chunking it.
-            with urllib.request.urlopen(urllib.request.Request(url, data=body, method=method, headers=headers), timeout=60) as reply:
-                return reply.status, reply.read()
-        except urllib.error.HTTPError as error:
-            if error.code == 404:
-                return 404, b""
-            die("R2 refused %s %s: %s" % (method, key or "the bucket list", s3_reason(error)))
-        except urllib.error.URLError as error:
-            die("cannot reach R2 at %s: %s" % (self.host, error.reason))
+        for attempt in range(1, tries + 1):
+            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            signed = dict(headers or {}, **{"host": self.host, "x-amz-content-sha256": digest, "x-amz-date": stamp})
+            signed["authorization"] = sigv4(method, path, query, signed, digest, self.key_id, self.secret, stamp)
+            del signed["host"]  # urllib sends it from the URL
+            try:
+                # With a file for the body and Content-Length set, urllib streams it rather than chunking it.
+                request = urllib.request.Request(url, data=body, method=method, headers=signed)
+                with urllib.request.urlopen(request, timeout=60) as reply:
+                    return reply.status, reply.read(), reply.headers
+            except urllib.error.HTTPError as error:
+                if error.code == 404:
+                    return 404, b"", error.headers
+                reason = s3_reason(error)
+                if error.code < 500 or attempt == tries:
+                    die("R2 refused %s %s: %s" % (method, key or "the bucket", reason))
+            except (OSError, http.client.HTTPException) as error:  # URLError, a timeout or a cut in mid-transfer
+                reason = getattr(error, "reason", error)
+                if attempt == tries:
+                    die("cannot reach R2 at %s: %s" % (self.host, reason))
+            say("share: %s %s failed (%s); trying again" % (method, key or "the bucket", reason))
+            if hasattr(body, "rewind"):
+                body.rewind()
+            time.sleep(2 ** attempt)
 
     def files(self):
         """Every file that is up, as Entry, in key order."""
         found, query = [], {"list-type": "2"}
         while True:
-            status, body = self.request("GET", query=query)
+            status, body, _ = self.request("GET", query=query)
             if status == 404:
                 die("there is no bucket %s; make it in the Cloudflare dashboard" % self.bucket)
             root = parse_xml(body)
@@ -481,24 +578,96 @@ class Bucket:
             query = dict(query, **{"continuation-token": token})
 
     def upload(self, items, wait):
-        """Puts each file that is not up yet. Always True: there is no build to wait for."""
-        added = []
-        for item in items:
-            key = "%s/%s/%s" % (item.prefix, item.ident, item.name)
-            if self.request("HEAD", key)[0] == 404:
-                say("uploading %s" % item.name)
-                with open(item.path, "rb") as handle:
-                    self.request("PUT", key, body=handle, digest=item.digest, headers={
-                        "cache-control": R2_CACHE_CONTROL,
-                        "content-disposition": disposition(item.name, item.original),
-                        "content-length": str(item.size),
-                        "content-type": content_type(item.path, item.name),
-                    })
-                added.append(self.url(item.prefix, item.ident, item.name))
+        """Puts each file that is not up yet, a few at a time. Always True: there is no build to wait for."""
+        missing = in_parallel(lambda item: self.request("HEAD", self.key(item))[0] == 404, items)
+        new = [item for item, gone in zip(items, missing) if gone]
+        if not new:
+            return True
+        say("uploading %s" % ", ".join(item.name for item in new))
+        progress = Progress(sum(item.size for item in new))
+        in_parallel(lambda item: self.put(item, progress), new)
+        progress.end()
         # Cloudflare caches a 404 too, so a file shared again after --rm would answer 404 for a few minutes.
-        if added and self.zone_id and self.purge_token:
-            self.purge(added)
+        if self.zone_id and self.purge_token:
+            self.purge([self.url(item.prefix, item.ident, item.name) for item in new])
         return True
+
+    @staticmethod
+    def key(item):
+        return "%s/%s/%s" % (item.prefix, item.ident, item.name)
+
+    def put(self, item, progress):
+        """Puts one file: in one request, or in parts when it is big."""
+        headers = {
+            "cache-control": R2_CACHE_CONTROL,
+            "content-disposition": disposition(item.name, item.original),
+            "content-type": content_type(item.path, item.name),
+        }
+        if item.size > MULTIPART_BYTES:
+            return self.put_parts(item, headers, progress)
+        body = Slice(item.path, 0, item.size, progress)
+        try:
+            self.request("PUT", self.key(item), body=body, digest=item.digest,
+                         headers=dict(headers, **{"content-length": str(item.size)}), tries=4)
+        finally:
+            body.close()
+
+    def put_parts(self, item, headers, progress):
+        """Puts a big file in parts. An upload of the same file that an earlier run left unfinished goes on from
+        the parts R2 already has, which it keeps for 7 days."""
+        key, size = self.key(item), item.size
+        part = part_bytes(size)
+        count = -(-size // part)
+        upload_id, have = self.unfinished(key)
+        if upload_id:
+            have = {n: etag for n, (etag, length) in have.items() if length == min(part, size - (n - 1) * part)}
+            say("going on with %s: R2 has %d of its %d parts" % (item.name, len(have), count))
+        else:
+            reply = self.request("POST", key, query={"uploads": ""}, headers=headers)[1]
+            upload_id, have = parse_xml(reply).findtext("UploadId"), {}
+        etags = {}
+        for number in range(1, count + 1):
+            offset = (number - 1) * part
+            length = min(part, size - offset)
+            if number in have:
+                etags[number] = have[number]
+                progress.add(length)
+                continue
+            body = Slice(item.path, offset, length, progress)
+            try:
+                reply = self.request("PUT", key, query={"partNumber": str(number), "uploadId": upload_id}, body=body,
+                                     digest=file_sha256(item.path, offset, length),
+                                     headers={"content-length": str(length)}, tries=4)
+            finally:
+                body.close()
+            etags[number] = reply[2]["ETag"]
+        done = "<CompleteMultipartUpload>%s</CompleteMultipartUpload>" % "".join(
+            "<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>" % (n, etags[n]) for n in sorted(etags))
+        reply = self.request("POST", key, query={"uploadId": upload_id}, body=done.encode(),
+                             digest=hashlib.sha256(done.encode()).hexdigest())[1]
+        root = parse_xml(reply)
+        if root.tag == "Error":  # S3 can answer 200 and still fail
+            die("R2 could not put %s together: %s: %s" % (item.name, root.findtext("Code"), root.findtext("Message")))
+
+    def unfinished(self, key):
+        """The id of an unfinished upload of this key and its parts as {number: (etag, size)}, or (None, {})."""
+        root = parse_xml(self.request("GET", query={"uploads": "", "prefix": key})[1])
+        uploads = sorted((u.findtext("Initiated") or "", u.findtext("UploadId"))
+                         for u in root.iter("Upload") if u.findtext("Key") == key)
+        if not uploads:
+            return None, {}
+        upload_id, parts, query = uploads[-1][1], {}, {"uploadId": uploads[-1][1]}
+        while True:
+            status, body, _ = self.request("GET", key, query=query)
+            if status == 404:
+                return None, {}
+            root = parse_xml(body)
+            for each in root.iter("Part"):
+                parts[int(each.findtext("PartNumber"))] = (each.findtext("ETag"), int(each.findtext("Size")))
+            marker = root.findtext("NextPartNumberMarker")
+            if root.findtext("IsTruncated") != "true" or not marker:
+                return upload_id, parts
+            query = dict(query, **{"part-number-marker": marker})
 
     def remove(self, doomed, wait):
         """Takes these files (Entry) down."""
@@ -509,6 +678,12 @@ class Bucket:
             say("and purged from Cloudflare's cache; a browser that already opened one may still show it")
         else:
             say("Cloudflare's cache may serve them for up to an hour")
+
+
+def part_bytes(size):
+    """The size of each part but the last: 16 MB, or more when 10,000 parts would not hold the file."""
+    needed = -(-size // MAX_PARTS)
+    return PART_BYTES if needed <= PART_BYTES else -(-needed // 1024**2) * 1024**2
 
 
 def cloudflare_reason(error):
@@ -575,7 +750,7 @@ def finish(links, copy):
 
 
 def cmd_share(paths, wait, copy):
-    limit, rule = (R2_MAX_BYTES, "R2 takes at most 5 GB") if r2_config() else (MAX_BYTES, "GitHub takes at most 100 MB")
+    limit, rule = (R2_MAX_BYTES, "R2 takes at most 5 TB") if r2_config() else (MAX_BYTES, "GitHub takes at most 100 MB")
     items = []
     for raw in paths:
         path = Path(raw).expanduser()
@@ -591,7 +766,7 @@ def cmd_share(paths, wait, copy):
             say("note: %s is %s, which is big for a link" % (path.name, human(size)))
         if path.suffix.lower() in OTHER_VIDEO:
             say("note: browsers play mp4 (H.264) and webm inline; %s may download instead" % path.name)
-        digest = sha256(path)
+        digest = file_sha256(path)
         items.append(Item(path, "f", digest[:10], clean_name(path.name), digest, size, path.name))
 
     store = open_store()
@@ -600,8 +775,7 @@ def cmd_share(paths, wait, copy):
     if not live:
         say("share: the build is still running, so the links may not work for another minute")
     elif wait:
-        for each in links:
-            kind = check_live(each)
+        for each, kind in zip(links, in_parallel(check_live, links)):
             if kind is None:
                 say("share: %s does not answer yet; try it again in a minute" % each)
             else:
@@ -721,4 +895,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        say("\nshare: stopped; a big upload goes on from where it stopped when you share the file again")
+        sys.exit(130)

@@ -75,6 +75,7 @@ class Human(unittest.TestCase):
         self.assertEqual(share.human(2048), "2.0 KB")
         self.assertEqual(share.human(5 * 1024**2), "5.0 MB")
         self.assertEqual(share.human(3 * 1024**3), "3.0 GB")
+        self.assertEqual(share.human(5 * 1024**4), "5.0 TB")
 
 
 class Sha256(unittest.TestCase):
@@ -83,7 +84,8 @@ class Sha256(unittest.TestCase):
             path = Path(tmp) / "a.bin"
             data = b"easel" * 500_000
             path.write_bytes(data)
-            self.assertEqual(share.sha256(path), hashlib.sha256(data).hexdigest())
+            self.assertEqual(share.file_sha256(path), hashlib.sha256(data).hexdigest())
+            self.assertEqual(share.file_sha256(path, 3, 7), hashlib.sha256(data[3:10]).hexdigest())
 
 
 class RefusesBeforeUploading(unittest.TestCase):
@@ -238,16 +240,25 @@ class Sigv4(unittest.TestCase):
 class Bucket(unittest.TestCase):
     """The bucket's requests are stubbed: these check what it asks for and how it reads the answers."""
 
-    def bucket(self, *replies):
-        bucket = share.Bucket(CONFIG)
+    def bucket(self, *replies, config=CONFIG):
+        bucket = share.Bucket(config)
         bucket.request = mock.Mock(side_effect=list(replies))
         return bucket
+
+    def answering(self, answer, config=CONFIG):
+        """A bucket whose requests go to answer(method, key, query), which may run in any order, as uploads do."""
+        bucket = share.Bucket(config)
+        bucket.request = mock.Mock(side_effect=lambda method, key="", query=None, **_: answer(method, key, query or {}))
+        return bucket
+
+    def calls(self, bucket, method):
+        return [call for call in bucket.request.call_args_list if call.args[0] == method]
 
     def page(self, keys, token=None):
         items = "".join("<Contents><Key>%s</Key><Size>%d</Size><LastModified>2026-10-28T01:21:10.962Z</LastModified></Contents>"
                         % (key, size) for key, size in keys)
         more = "<IsTruncated>true</IsTruncated><NextContinuationToken>%s</NextContinuationToken>" % token if token else ""
-        return 200, ('<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">%s%s</ListBucketResult>' % (items, more)).encode()
+        return 200, ('<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">%s%s</ListBucketResult>' % (items, more)).encode(), {}
 
     def test_files_reads_every_page(self):
         bucket = self.bucket(self.page([("f/aaaaaaaaaa/a.png", 10)], token="next"), self.page([("f/bbbbbbbbbb/b.mp4", 20)]))
@@ -264,70 +275,133 @@ class Bucket(unittest.TestCase):
             new, old = Path(tmp) / "clip.mp4", Path(tmp) / "pic.png"
             new.write_bytes(b"video")
             old.write_bytes(b"picture")
-            bucket = self.bucket((404, b""), (200, b""), (200, b""))
+            sent = []
+
+            def answer(method, key, query):
+                if method == "PUT":
+                    body = bucket.request.call_args.kwargs["body"]
+                    sent.append(body.read())
+                return (404 if key.endswith("clip.mp4") and method == "HEAD" else 200), b"", {}
+            bucket = self.answering(answer)
             with mock.patch.object(share, "say"):
                 bucket.upload([item(new, "aaaaaaaaaa", "d1", "My Clip é.mp4"), item(old, "bbbbbbbbbb", "d2")], wait=True)
-        put = bucket.request.call_args_list[1]
+        self.assertEqual(len(self.calls(bucket, "HEAD")), 2)
+        [put] = self.calls(bucket, "PUT")
         self.assertEqual(put.args, ("PUT", "f/aaaaaaaaaa/clip.mp4"))
+        self.assertEqual(sent, [b"video"])
         self.assertEqual(put.kwargs["digest"], "d1")
         self.assertEqual(put.kwargs["headers"]["content-type"], "video/mp4")
         self.assertEqual(put.kwargs["headers"]["content-length"], "5")
         self.assertEqual(put.kwargs["headers"]["content-disposition"],
                          "inline; filename=\"clip.mp4\"; filename*=UTF-8''My%20Clip%20%C3%A9.mp4")
-        self.assertEqual(bucket.request.call_args_list[2].args, ("HEAD", "f/bbbbbbbbbb/pic.png"))
-        self.assertEqual(bucket.request.call_count, 3)
 
     def test_links_use_the_public_url(self):
         self.assertEqual(share.Bucket(CONFIG).url("f", "aaaaaaaaaa", "a.png"), "https://share.example.com/f/aaaaaaaaaa/a.png")
 
 
-class Purge(unittest.TestCase):
-    """--rm on R2 deletes, then asks Cloudflare to drop the links from its cache; the calls are stubbed."""
+class Parts(unittest.TestCase):
+    """A big file goes up in parts, and a run after one that broke off sends only the parts R2 lacks."""
 
-    def remove(self, config, count, purge_error=None):
-        bucket = share.Bucket(config)
-        bucket.request = mock.Mock(return_value=(204, b""))
-        said = []
-        with mock.patch.object(share.urllib.request, "urlopen", side_effect=purge_error) as urlopen, \
-                mock.patch.object(share, "say", side_effect=said.append):
-            bucket.remove([share.Entry("f", "%010d" % i, "f%d.png" % i, 1, 0) for i in range(count)], wait=True)
-        return bucket, urlopen, said
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "big.mp4"
+        self.path.write_bytes(b"a" * 5 + b"b" * 5 + b"c" * 3)  # parts of 5, 5 and 3 bytes
+        patches = [mock.patch.object(share, "PART_BYTES", 5), mock.patch.object(share, "MULTIPART_BYTES", 4),
+                   mock.patch.object(share, "say")]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
 
-    def test_without_a_token_nothing_is_purged(self):
-        bucket, urlopen, said = self.remove(CONFIG, 2)
-        self.assertEqual(bucket.request.call_count, 2)
-        urlopen.assert_not_called()
-        self.assertIn("up to an hour", said[-1])
+    def put(self, unfinished=""):
+        sent = {}
 
-    def test_the_removed_links_are_purged_30_at_a_time(self):
-        bucket, urlopen, said = self.remove(dict(CONFIG, zone_id="zone", purge_token="tok"), 31)
-        self.assertEqual(urlopen.call_count, 2)
-        first = urlopen.call_args_list[0].args[0]
-        self.assertEqual(first.full_url, "https://api.cloudflare.com/client/v4/zones/zone/purge_cache")
-        self.assertEqual(first.get_header("Authorization"), "Bearer tok")
-        files = json.loads(first.data)["files"]
-        self.assertEqual(len(files), 30)
-        self.assertEqual(files[0], "https://share.example.com/f/0000000000/f0.png")
-        self.assertIn("purged", said[-1])
+        def answer(method, key="", query=None, body=None, digest=None, headers=None, tries=3):
+            query = query or {}
+            if method == "GET" and "uploads" in query:
+                return 200, ("<ListMultipartUploadsResult>%s</ListMultipartUploadsResult>" % unfinished).encode(), {}
+            if method == "GET":
+                return 200, (b"<ListPartsResult><Part><PartNumber>1</PartNumber><ETag>\"e1\"</ETag><Size>5</Size></Part>"
+                             b"<Part><PartNumber>3</PartNumber><ETag>\"short\"</ETag><Size>2</Size></Part></ListPartsResult>"), {}
+            if method == "POST" and "uploads" in query:
+                return 200, b"<InitiateMultipartUploadResult><UploadId>new</UploadId></InitiateMultipartUploadResult>", {}
+            if method == "PUT":
+                number = int(query["partNumber"])
+                sent[number] = (query["uploadId"], body.read(), digest)
+                return 200, b"", {"ETag": '"e%d"' % number}
+            return 200, b"<CompleteMultipartUploadResult/>", {}
+        bucket = share.Bucket(CONFIG)
+        bucket.request = mock.Mock(side_effect=answer)
+        bucket.put(item(self.path, "aaaaaaaaaa", "d"), share.Progress(13))
+        done = bucket.request.call_args
+        return sent, done
 
-    def test_new_uploads_are_purged_so_a_cached_404_goes(self):
-        bucket = share.Bucket(dict(CONFIG, zone_id="zone", purge_token="tok"))
-        bucket.request = mock.Mock(side_effect=[(404, b""), (200, b""), (200, b"")])
-        bucket.purge = mock.Mock(return_value=True)
+    def test_a_new_upload_sends_every_part_and_puts_them_together(self):
+        sent, done = self.put()
+        self.assertEqual({n: body for n, (_, body, _) in sent.items()}, {1: b"aaaaa", 2: b"bbbbb", 3: b"ccc"})
+        self.assertEqual(sent[2][2], hashlib.sha256(b"bbbbb").hexdigest())
+        self.assertEqual(done.kwargs["query"], {"uploadId": "new"})
+        self.assertIn(b"<PartNumber>3</PartNumber><ETag>\"e3\"</ETag>", done.kwargs["body"])
+
+    def test_an_unfinished_upload_goes_on_from_the_parts_r2_has(self):
+        sent, done = self.put("<Upload><Key>f/aaaaaaaaaa/big.mp4</Key><UploadId>old</UploadId></Upload>")
+        # Part 1 is there; part 3 is there but the wrong size, so it goes again.
+        self.assertEqual(sorted(sent), [2, 3])
+        self.assertEqual(sent[2][0], "old")
+        self.assertIn(b"<PartNumber>1</PartNumber><ETag>\"e1\"</ETag>", done.kwargs["body"])
+
+
+class Stopping(unittest.TestCase):
+    def test_ctrl_c_stops_an_upload_at_its_next_read(self):
         with tempfile.TemporaryDirectory() as tmp:
-            new, old = Path(tmp) / "new.png", Path(tmp) / "old.png"
-            new.write_bytes(b"n")
-            old.write_bytes(b"o")
-            with mock.patch.object(share, "say"):
-                bucket.upload([item(new, "aaaaaaaaaa", "d1"), item(old, "bbbbbbbbbb", "d2")], wait=True)
-        bucket.purge.assert_called_once_with(["https://share.example.com/f/aaaaaaaaaa/new.png"])
+            path = Path(tmp) / "a.bin"
+            path.write_bytes(b"data")
+            body = share.Slice(path, 0, 4, share.Progress(4))
+            self.addCleanup(body.close)
+            share.stopping.set()
+            self.addCleanup(share.stopping.clear)
+            with self.assertRaises(KeyboardInterrupt):
+                body.read(2)
 
-    def test_a_refused_purge_only_warns(self):
-        error = share.urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(
-            b'{"success": false, "errors": [{"code": 10000, "message": "Authentication error"}]}'))
-        bucket, urlopen, said = self.remove(dict(CONFIG, zone_id="zone", purge_token="tok"), 1, purge_error=error)
-        self.assertIn("10000 Authentication error", said[-2])
-        self.assertIn("up to an hour", said[-1])
+
+class PartBytes(unittest.TestCase):
+    def test_part_size_grows_so_10000_parts_hold_the_file(self):
+        self.assertEqual(share.part_bytes(5 * 1024**3), 16 * 1024**2)
+        self.assertEqual(share.part_bytes(1024**4), 105 * 1024**2)
+
+
+class Retries(unittest.TestCase):
+    """A dropped connection or an error on R2's side is tried again; a refusal is not."""
+
+    def test_a_dropped_connection_is_tried_again_from_the_start_of_the_body(self):
+        progress = share.Progress(4)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.bin"
+            path.write_bytes(b"data")
+            body = share.Slice(path, 0, 4, progress)
+            reads = []
+
+            def flaky(request, timeout):
+                reads.append(request.data.read())
+                if len(reads) == 1:
+                    raise ConnectionResetError("reset")
+                reply = mock.MagicMock()
+                reply.__enter__.return_value.status = 200
+                reply.__enter__.return_value.read.return_value = b""
+                return reply
+            with mock.patch.object(share.urllib.request, "urlopen", side_effect=flaky), \
+                    mock.patch.object(share.time, "sleep"), mock.patch.object(share, "say"):
+                share.Bucket(CONFIG).request("PUT", "f/a/a.bin", body=body, digest="d", tries=4)
+            body.close()
+        self.assertEqual(reads, [b"data", b"data"])
+        self.assertEqual(progress.done, 4)
+
+    def test_a_refusal_ends_the_program_at_once(self):
+        error = share.urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b"<Error><Code>AccessDenied</Code></Error>"))
+        with mock.patch.object(share.urllib.request, "urlopen", side_effect=error) as urlopen, \
+                mock.patch.object(share, "say"), self.assertRaises(SystemExit):
+            share.Bucket(CONFIG).request("GET")
+        self.assertEqual(urlopen.call_count, 1)
 
 
 class Remove(unittest.TestCase):
