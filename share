@@ -2,7 +2,9 @@
 """share: put pictures and videos on the web and print a link to paste.
 
     share PATH [PATH ...]    upload, wait until the link works, print one link per file
-    share --list             every file that is up, with its link
+    share                    share what is on the clipboard: a screenshot, or files copied
+    share -                  share what is piped in, such as `grim - | share -`
+    share --list             every file that is up, newest first, with its date and link
     share --rm TARGET ...    take files down (a link, a 10-character id or a file name)
     share --setup            store Cloudflare R2 settings; from then on files go there
 
@@ -14,6 +16,7 @@ link.
   * Cloudflare R2, once `share --setup` has stored its settings in ~/.config/share/r2.json. A
     bucket behind your own domain serves a file the moment its upload ends. Up to 5 TB a file; one
     over 100 MB goes up in parts, and if the connection drops, the next run goes on from the last part.
+    --expire 7d puts files at <base>/7d/<id>/<name> instead, and R2 deletes them 7 days later.
   * Otherwise a public GitHub repo of your own (default <you>/share, made on first use with `gh`),
     served by GitHub Pages at https://<you>.github.io/share/. A link works only once Pages has
     deployed it, usually 15 to 25 seconds after the push, and this waits for it. Up to 100 MB a
@@ -23,7 +26,10 @@ link.
 Things to know:
   * Anyone with a link can open the file, and anyone can browse the GitHub repo. Never share what
     you would not post openly.
-  * Browsers play mp4 (H.264) and webm inline; .mov, .mkv and .avi may download instead.
+  * Pictures and videos go up without where, when and on what they were taken (with exiftool for
+    every format it knows, else for JPEG and PNG only). --keep-metadata leaves them as they are.
+  * Browsers play mp4 (H.264) and webm inline; .mov, .mkv and .avi may download instead. --mp4
+    converts them with ffmpeg first.
   * --rm on R2 deletes the file at once. With a Cache Purge token in the settings it also clears
     Cloudflare's cache, so the link stops working at once; without one the cache may serve the file
     for up to an hour. A browser that already opened it may keep showing it either way.
