@@ -17,8 +17,8 @@ share --help                        # limits and caveats
 ```
 
 Pictures and videos go up without the place, time and camera they were taken with. The
-orientation and colour profile stay, so they look the same. `--keep-metadata` leaves a file as it
-is.
+orientation and colour profile stay, so they look the same. A RAW photo keeps its date and camera,
+which raw converters need to read it. `--keep-metadata` leaves a file as it is.
 
 ## Install
 
@@ -77,14 +77,28 @@ converting, so the same file always gets the same link. Files shared with `--exp
 after upload. R2 may take up to a day longer.
 
 **Before an upload.** A copy of each picture or video is made in `~/.cache/share/` and deleted
-when `share` ends. `exiftool` strips the copy when it is installed, keeping only the orientation
-and colour profile. It handles nearly every picture and video format. Without it, `share` strips
-JPEG and PNG itself: it keeps the picture data, the colour profile and an Exif block holding only
-the orientation, and drops everything else, including the extra pictures some phones add after
-the end. Other formats then go up as they are, with a note. `--mp4` runs `ffmpeg`. A video stream
-that is already H.264 is copied rather than encoded again, other video is encoded with `libx264`,
-and sound that is not AAC becomes AAC. The mp4 has its index at the start, so it plays while it
-loads, and no metadata.
+when `share` ends. `exiftool` strips a picture when it is installed, keeping only the orientation
+and colour profile. It handles nearly every picture format, camera RAW included, though in a RAW
+photo it removes only the place: the date and camera stay, because raw converters need the rest.
+Without it, `share` strips JPEG and PNG itself: it keeps the picture data, the colour profile and
+an Exif block holding only the orientation, and drops everything else, including the extra
+pictures some phones add after the end. Other formats then go up as they are, with a note.
+
+`ffmpeg` strips a video by copying its picture and sound into a new file, encoding nothing again.
+Everything else stays behind: metadata, the file's dates (they come out as zero), and other
+tracks, such as the GPS route drones and action cameras record beside the video. Camcorder
+`.mts` files keep the time and place inside the H.264 stream, in SEI messages, and those go too.
+The rotation stays. Without `ffmpeg`, a video goes up as it is, with a note.
+
+`--mp4` also runs `ffmpeg`. A video stream that is already H.264 is copied rather than encoded
+again, other video is encoded with `libx264`, and sound that is not AAC becomes AAC. The mp4 has
+its index at the start, so it plays while it loads, and no metadata.
+
+ffmpeg decides how to read a file from what is in it, not from its name, and some formats it
+reads, such as playlists, pull in other files. So `share` first asks `ffprobe` what the file is,
+and has `ffmpeg` read it only as a video container (`mov`, `matroska`, `avi`, `mpegts` and a few
+more), from local files only. A playlist named `funny.mov` that lists another of your videos is
+refused, not uploaded with that video inside.
 
 **Input.** `share` with no path reads the Wayland clipboard with `wl-paste`. Files copied in a
 file manager (`text/uri-list`) are shared by path. Otherwise a picture on the clipboard is saved
@@ -118,8 +132,8 @@ run; that one run is slow, because two deploys run back to back. The local clone
 
 **R2:** there is no build. A new 1 MB picture takes about 0.9 s, from start to a link that
 answers: one request asks whether the file is there, one puts it, and one checks the public link.
-The cache purge, when set up, adds about 0.35 s, and stripping a picture's metadata with
-exiftool about 0.2 s. A bigger
+The cache purge, when set up, adds about 0.35 s. Stripping a picture's metadata with exiftool
+adds about 0.2 s, and stripping a video with ffmpeg about 0.1 s per 100 MB. A bigger
 file adds only its upload time: a 51 MB clip took 5.1 s on an 85 Mbit/s uplink. Re-sharing a file
 that is up takes under 1 s.
 
@@ -160,7 +174,8 @@ python3 -m unittest discover -s tests -v
 They cover name cleaning, size messages, the checks that run before anything is uploaded, the R2
 settings, request signing (against cases from AWS's SigV4 test suite), reading bucket lists,
 multipart uploads and resuming them, retries, expiry rules, metadata stripping (on JPEGs and PNGs
-built byte by byte), `--mp4`'s choices, the clipboard and stdin, `--rm`'s question and the wait for
+built byte by byte, and the exiftool and ffmpeg commands for other pictures, RAW photos and
+videos), refusing playlists named like videos, `--mp4`'s choices, the clipboard and stdin, `--rm`'s question and the wait for
 Pages. None of them touch the network or need `exiftool` or `ffmpeg`, and none read your real R2
 settings.
 
