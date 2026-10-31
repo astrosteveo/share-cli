@@ -158,7 +158,8 @@ def clean_name(name):
     return stem + suffix
 
 
-# A file that is up: `prefix` is the folder it is in, `f` (kept until --rm), and `modified` is when it went up.
+# A file that is up: `prefix` is the folder it is in, `f` (kept until --rm) or `<n>d` (deleted by R2 n days after it
+# went up), and `modified` is when it went up.
 Entry = namedtuple("Entry", "prefix ident name size modified")
 # A file to put up: `path` holds its bytes, `name` is its name in the link and `original` the name it had.
 Item = namedtuple("Item", "path prefix ident name digest size original")
@@ -171,9 +172,22 @@ def link(base, prefix, ident, name):
 def parse_key(key):
     """(prefix, id, name) for a key in the layout `<prefix>/<id>/<name>`, else None."""
     parts = key.split("/")
-    if len(parts) == 3 and parts[0] == "f" and re.fullmatch(r"[0-9a-f]{10}", parts[1]) and parts[2]:
+    if len(parts) == 3 and re.fullmatch(r"f|[1-9][0-9]*d", parts[0]) and re.fullmatch(r"[0-9a-f]{10}", parts[1]) and parts[2]:
         return tuple(parts)
     return None
+
+
+def expiry_days(prefix):
+    """How many days after upload R2 deletes a file in this folder, or None for `f`, which keeps its files."""
+    return int(prefix[:-1]) if prefix.endswith("d") else None
+
+
+def days_text(days):
+    return "1 day" if days == 1 else "%d days" % days
+
+
+def day(stamp):
+    return time.strftime("%Y-%m-%d", time.localtime(stamp))
 
 
 def parse_xml(body):
@@ -186,6 +200,15 @@ def parse_xml(body):
 
 def config_path():
     return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "share" / "r2.json"
+
+
+def save_config(config):
+    """Writes the R2 settings where only you can read them."""
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+        json.dump(config, handle, indent=2)
+    os.chmod(path, 0o600)
 
 
 def r2_config():
@@ -579,14 +602,23 @@ class Bucket:
 
     def upload(self, items, wait):
         """Puts each file that is not up yet, a few at a time. Always True: there is no build to wait for."""
-        missing = in_parallel(lambda item: self.request("HEAD", self.key(item))[0] == 404, items)
-        new = [item for item, gone in zip(items, missing) if gone]
+        heads = in_parallel(lambda item: self.request("HEAD", self.key(item)), items)
+        new = [item for item, head in zip(items, heads) if head[0] == 404]
+        for item, (status, _, headers) in zip(items, heads):
+            days = expiry_days(item.prefix)
+            if status != 404 and days and headers.get("Last-Modified"):
+                since = calendar.timegm(time.strptime(headers["Last-Modified"], "%a, %d %b %Y %H:%M:%S GMT"))
+                say("note: %s went up on %s, so it is deleted about %s" % (item.name, day(since), day(since + days * 86400)))
         if not new:
             return True
         say("uploading %s" % ", ".join(item.name for item in new))
         progress = Progress(sum(item.size for item in new))
         in_parallel(lambda item: self.put(item, progress), new)
         progress.end()
+        days = expiry_days(new[0].prefix)
+        if days:
+            say("R2 deletes %s about %s, %s from now (it can take up to a day longer)"
+                % (", ".join(item.name for item in new), day(time.time() + days * 86400), days_text(days)))
         # Cloudflare caches a 404 too, so a file shared again after --rm would answer 404 for a few minutes.
         if self.zone_id and self.purge_token:
             self.purge([self.url(item.prefix, item.ident, item.name) for item in new])
@@ -706,6 +738,39 @@ def s3_reason(error):
     return "%s: %s" % (root.findtext("Code"), root.findtext("Message"))
 
 
+def expiry_rule(config, days):
+    """Makes sure R2 deletes files in `<days>d/` that many days after they go up. A bucket's lifecycle rules need a
+    token the share settings do not hold, so this asks the Cloudflare CLI, once for each number of days."""
+    if days in config.get("expire_days", []):
+        return
+    prefix = "%dd/" % days
+    by_hand = ("or add it in the dashboard: R2 -> %s -> Settings -> Object Lifecycle Rules, prefix %s, delete "
+               "objects %s after upload; then run this again with SHARE_EXPIRE_RULE_SET=1" % (config["bucket"], prefix, days_text(days)))
+    if os.environ.get("SHARE_EXPIRE_RULE_SET") != "1":
+        if not shutil.which("cf"):
+            die("--expire needs a lifecycle rule on the bucket. Install the Cloudflare CLI (cf) and log in, " + by_hand)
+        say("adding a lifecycle rule to %s: delete files in %s %s after upload (once)" % (config["bucket"], prefix, days_text(days)))
+        env = dict(os.environ, CLOUDFLARE_ACCOUNT_ID=urllib.parse.urlsplit(config["endpoint"]).netloc.split(".")[0])
+        cf = ["cf", "r2", "buckets", "lifecycle"]
+        got = subprocess.run(cf + ["get", config["bucket"], "-q"], capture_output=True, text=True, env=env)
+        try:
+            rules = json.loads(got.stdout).get("rules") or []
+        except ValueError:
+            die("cf could not read the bucket's lifecycle rules: %s\nLog in with `cf auth login`, %s"
+                % ((got.stderr or got.stdout).strip(), by_hand))
+        rule_id = "share-expire-%dd" % days
+        rules = [rule for rule in rules if rule.get("id") != rule_id] + [{
+            "id": rule_id, "enabled": True, "conditions": {"prefix": prefix},
+            "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": days * 86400}},
+        }]
+        put = subprocess.run(cf + ["update", config["bucket"], "--rules", json.dumps(rules), "-f", "-q"],
+                             capture_output=True, text=True, env=env)
+        if put.returncode:
+            die("cf could not add the lifecycle rule: %s\nInstead, %s" % ((put.stderr or put.stdout).strip(), by_hand))
+    config["expire_days"] = sorted(set(config.get("expire_days", [])) | {days})
+    save_config(config)
+
+
 def open_store():
     """Where the files go: the R2 bucket once it is set up, else the GitHub repo, synced."""
     config = r2_config()
@@ -749,8 +814,13 @@ def finish(links, copy):
         say("copied to the clipboard")
 
 
-def cmd_share(paths, wait, copy):
-    limit, rule = (R2_MAX_BYTES, "R2 takes at most 5 TB") if r2_config() else (MAX_BYTES, "GitHub takes at most 100 MB")
+def cmd_share(paths, wait=True, copy=True, expire=None):
+    """Puts the files up and prints their links. With `expire`, a number of days, R2 deletes them that long after."""
+    config = r2_config()
+    if expire and not config:
+        die("--expire needs Cloudflare R2 (see share --setup); GitHub Pages cannot delete a file on a timer")
+    limit, rule = (R2_MAX_BYTES, "R2 takes at most 5 TB") if config else (MAX_BYTES, "GitHub takes at most 100 MB")
+    prefix = "%dd" % expire if expire else "f"
     items = []
     for raw in paths:
         path = Path(raw).expanduser()
@@ -767,8 +837,10 @@ def cmd_share(paths, wait, copy):
         if path.suffix.lower() in OTHER_VIDEO:
             say("note: browsers play mp4 (H.264) and webm inline; %s may download instead" % path.name)
         digest = file_sha256(path)
-        items.append(Item(path, "f", digest[:10], clean_name(path.name), digest, size, path.name))
+        items.append(Item(path, prefix, digest[:10], clean_name(path.name), digest, size, path.name))
 
+    if expire:
+        expiry_rule(config, expire)
     store = open_store()
     live = store.upload(items, wait)
     links = [store.url(item.prefix, item.ident, item.name) for item in items]
@@ -791,8 +863,11 @@ def cmd_list():
         say("nothing is up")
         return
     for entry in found:
-        print("%s  %8s  %s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.modified)), human(entry.size),
-                               store.url(entry.prefix, entry.ident, entry.name)))
+        days = expiry_days(entry.prefix)
+        until = "  (deleted about %s)" % day(entry.modified + days * 86400) if days else ""
+        print("%s  %8s  %s%s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.modified)), human(entry.size),
+                                 store.url(entry.prefix, entry.ident, entry.name), until))
+    sys.stdout.flush()
     room = "R2's free tier holds 10 GB" if isinstance(store, Bucket) else "GitHub Pages holds about 1 GB"
     say("%d file(s), %s in all; %s" % (len(found), human(sum(entry.size for entry in found)), room))
 
@@ -803,7 +878,7 @@ def cmd_rm(targets, wait, yes=False):
     found = store.files()
     doomed = []
     for target in targets:
-        match = re.search(r"/(f)/([0-9a-f]{10})/", target)
+        match = re.search(r"/(f|[1-9][0-9]*d)/([0-9a-f]{10})/", target)
         if match:
             hits = [e for e in found if (e.prefix, e.ident) == match.groups()]
         else:
@@ -862,11 +937,20 @@ def cmd_setup():
         pass  # any answer means the domain and its certificate work
     except urllib.error.URLError as error:
         say("note: %s does not answer yet (%s); check that the custom domain is Active" % (config["public_url"], error.reason))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
-        json.dump(config, handle, indent=2)
-    os.chmod(path, 0o600)
+    config["expire_days"] = old.get("expire_days", []) if old.get("endpoint") == config["endpoint"] and \
+        old.get("bucket") == config["bucket"] else []
+    if not config["expire_days"]:
+        del config["expire_days"]
+    save_config(config)
     say("saved; `share FILE` now puts files on %s" % config["public_url"])
+
+
+def parse_days(text):
+    """--expire's value, `7d` or `7`, as a number of days."""
+    match = re.fullmatch(r"([1-9][0-9]{0,3})d?", text.strip().lower())
+    if not match:
+        raise argparse.ArgumentTypeError("give a number of days, such as 7d")
+    return int(match.group(1))
 
 
 def main():
@@ -878,6 +962,8 @@ def main():
     parser.add_argument("--list", action="store_true", help="list what is up, with links")
     parser.add_argument("--rm", nargs="+", metavar="TARGET", help="take files down: a link, an id or a file name")
     parser.add_argument("--setup", action="store_true", help="store Cloudflare R2 settings; from then on files go there")
+    parser.add_argument("--expire", metavar="DAYS", type=parse_days,
+                        help="R2 deletes the files this many days after upload, such as 7d (R2 only)")
     parser.add_argument("-y", "--yes", action="store_true", help="with --rm, take down every match without asking")
     parser.add_argument("--no-wait", action="store_true", help="print the links without waiting for the Pages build")
     parser.add_argument("--no-copy", action="store_true", help="leave the clipboard alone")
@@ -889,7 +975,7 @@ def main():
     elif args.rm:
         cmd_rm(args.rm, not args.no_wait, args.yes)
     elif args.paths:
-        cmd_share(args.paths, not args.no_wait, not args.no_copy)
+        cmd_share(args.paths, not args.no_wait, not args.no_copy, args.expire)
     else:
         parser.print_help()
 
