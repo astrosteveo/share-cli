@@ -239,17 +239,20 @@ class Bucket(unittest.TestCase):
         return bucket
 
     def page(self, keys, token=None):
-        items = "".join("<Contents><Key>%s</Key><Size>%d</Size></Contents>" % (key, size) for key, size in keys)
+        items = "".join("<Contents><Key>%s</Key><Size>%d</Size><LastModified>2026-10-28T01:21:10.962Z</LastModified></Contents>"
+                        % (key, size) for key, size in keys)
         more = "<IsTruncated>true</IsTruncated><NextContinuationToken>%s</NextContinuationToken>" % token if token else ""
         return 200, ('<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">%s%s</ListBucketResult>' % (items, more)).encode()
 
     def test_files_reads_every_page(self):
         bucket = self.bucket(self.page([("f/aaaaaaaaaa/a.png", 10)], token="next"), self.page([("f/bbbbbbbbbb/b.mp4", 20)]))
-        self.assertEqual(bucket.files(), [("aaaaaaaaaa", "a.png", 10), ("bbbbbbbbbb", "b.mp4", 20)])
+        stamp = 1793150470  # 2026-10-28T01:21:10Z
+        self.assertEqual(bucket.files(), [share.Entry("f", "aaaaaaaaaa", "a.png", 10, stamp),
+                                          share.Entry("f", "bbbbbbbbbb", "b.mp4", 20, stamp)])
         self.assertEqual(bucket.request.call_args.kwargs["query"]["continuation-token"], "next")
 
     def test_files_skips_keys_outside_the_layout(self):
-        self.assertEqual(self.bucket(self.page([("f/stray.txt", 1)])).files(), [])
+        self.assertEqual(self.bucket(self.page([("f/stray.txt", 1), ("other/aaaaaaaaaa/a.png", 1)])).files(), [])
 
     def test_upload_puts_only_what_is_not_up(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,7 +271,7 @@ class Bucket(unittest.TestCase):
         self.assertEqual(bucket.request.call_count, 3)
 
     def test_links_use_the_public_url(self):
-        self.assertEqual(share.Bucket(CONFIG).url("aaaaaaaaaa", "a.png"), "https://share.example.com/f/aaaaaaaaaa/a.png")
+        self.assertEqual(share.Bucket(CONFIG).url("f", "aaaaaaaaaa", "a.png"), "https://share.example.com/f/aaaaaaaaaa/a.png")
 
 
 class Purge(unittest.TestCase):
@@ -280,7 +283,7 @@ class Purge(unittest.TestCase):
         said = []
         with mock.patch.object(share.urllib.request, "urlopen", side_effect=purge_error) as urlopen, \
                 mock.patch.object(share, "say", side_effect=said.append):
-            bucket.remove([("%010d" % i, "f%d.png" % i) for i in range(count)], wait=True)
+            bucket.remove([share.Entry("f", "%010d" % i, "f%d.png" % i, 1, 0) for i in range(count)], wait=True)
         return bucket, urlopen, said
 
     def test_without_a_token_nothing_is_purged(self):

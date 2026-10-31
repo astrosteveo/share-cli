@@ -35,6 +35,7 @@ links are also copied to the clipboard.
 """
 
 import argparse
+import calendar
 import codecs
 import getpass
 import hashlib
@@ -51,6 +52,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import namedtuple
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -147,8 +149,28 @@ def clean_name(name):
     return stem + suffix
 
 
-def link(base, ident, name):
-    return "%sf/%s/%s" % (base, ident, urllib.parse.quote(name))
+# A file that is up: `prefix` is the folder it is in, `f` (kept until --rm), and `modified` is when it went up.
+Entry = namedtuple("Entry", "prefix ident name size modified")
+
+
+def link(base, prefix, ident, name):
+    return "%s%s/%s/%s" % (base, prefix, ident, urllib.parse.quote(name))
+
+
+def parse_key(key):
+    """(prefix, id, name) for a key in the layout `<prefix>/<id>/<name>`, else None."""
+    parts = key.split("/")
+    if len(parts) == 3 and parts[0] == "f" and re.fullmatch(r"[0-9a-f]{10}", parts[1]) and parts[2]:
+        return tuple(parts)
+    return None
+
+
+def parse_xml(body):
+    """An S3 answer as an element tree, with the S3 namespace dropped from every tag."""
+    root = ElementTree.fromstring(body)
+    for element in root.iter():
+        element.tag = element.tag.rsplit("}", 1)[-1]
+    return root
 
 
 def config_path():
@@ -241,8 +263,8 @@ class Site:
         self.base = "https://%s.github.io/%s/" % (self.owner, self.name)
         self.branch = "main"
 
-    def url(self, ident, name):
-        return link(self.base, ident, name)
+    def url(self, prefix, ident, name):
+        return link(self.base, prefix, ident, name)
 
     def api(self, path):
         """The JSON gh gets for an API path, or {} if the call fails, so a poll that misses an answer tries again."""
@@ -329,11 +351,18 @@ class Site:
         return False
 
     def files(self):
-        """Every file that is up, as (id, name, size), in name order."""
+        """Every file that is up, as Entry, in name order. A file went up with the newest commit that touched it."""
+        added, stamp = {}, 0
+        for line in git(self.clone, "log", "--format=%ct", "--name-only", "--", "f").stdout.splitlines():
+            if line.startswith("f/"):
+                added.setdefault(line, stamp)
+            elif line.strip():
+                stamp = int(line)
         found = []
         for path in sorted((self.clone / "f").glob("*/*")):
-            if path.is_file():
-                found.append((path.parent.name, path.name, path.stat().st_size))
+            key = path.relative_to(self.clone).as_posix()
+            if path.is_file() and parse_key(key):
+                found.append(Entry("f", path.parent.name, path.name, path.stat().st_size, added.get(key, 0)))
         return found
 
     def upload(self, items, wait):
@@ -353,9 +382,9 @@ class Site:
         return not wait or self.wait_for_build(sha)
 
     def remove(self, doomed, wait):
-        """Takes these (id, name) files down, from the history too."""
-        for ident in sorted({ident for ident, _ in doomed}):
-            git(self.clone, "rm", "-rq", "f/" + ident)
+        """Takes these files (Entry) down, from the history too."""
+        for entry in doomed:
+            git(self.clone, "rm", "-q", "%s/%s/%s" % (entry.prefix, entry.ident, entry.name))
         # One fresh commit of what is left, so the removed bytes leave the branch history too.
         git(self.clone, "checkout", "-q", "--orphan", "_rewrite")
         git(self.clone, "commit", "-q", "-m", "share files")
@@ -381,8 +410,8 @@ class Bucket:
         self.base = config["public_url"].rstrip("/") + "/"
         self.zone_id, self.purge_token = config.get("zone_id"), config.get("purge_token")
 
-    def url(self, ident, name):
-        return link(self.base, ident, name)
+    def url(self, prefix, ident, name):
+        return link(self.base, prefix, ident, name)
 
     def purge(self, urls):
         """Drops these links from Cloudflare's cache. True if it did; a failure only warns, as the files are gone already."""
@@ -422,19 +451,19 @@ class Bucket:
             die("cannot reach R2 at %s: %s" % (self.host, error.reason))
 
     def files(self):
-        """Every file that is up, as (id, name, size), in name order."""
-        found, query = [], {"list-type": "2", "prefix": "f/"}
+        """Every file that is up, as Entry, in key order."""
+        found, query = [], {"list-type": "2"}
         while True:
             status, body = self.request("GET", query=query)
             if status == 404:
                 die("there is no bucket %s; make it in the Cloudflare dashboard" % self.bucket)
-            root = ElementTree.fromstring(body)
-            for element in root.iter():
-                element.tag = element.tag.rsplit("}", 1)[-1]  # drop the S3 namespace
+            root = parse_xml(body)
             for item in root.iter("Contents"):
-                parts = item.findtext("Key").split("/")
-                if len(parts) == 3:
-                    found.append((parts[1], parts[2], int(item.findtext("Size"))))
+                parts = parse_key(item.findtext("Key"))
+                if parts:
+                    stamp = item.findtext("LastModified") or ""
+                    modified = calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")) if stamp else 0
+                    found.append(Entry(*parts, int(item.findtext("Size")), modified))
             token = root.findtext("NextContinuationToken")
             if root.findtext("IsTruncated") != "true" or not token:
                 return found
@@ -453,18 +482,18 @@ class Bucket:
                         "content-length": str(path.stat().st_size),
                         "content-type": content_type(path, name),
                     })
-                added.append(self.url(ident, name))
+                added.append(self.url("f", ident, name))
         # Cloudflare caches a 404 too, so a file shared again after --rm would answer 404 for a few minutes.
         if added and self.zone_id and self.purge_token:
             self.purge(added)
         return True
 
     def remove(self, doomed, wait):
-        """Takes these (id, name) files down."""
-        for ident, name in doomed:
-            self.request("DELETE", "f/%s/%s" % (ident, name))
+        """Takes these files (Entry) down."""
+        for entry in doomed:
+            self.request("DELETE", "%s/%s/%s" % (entry.prefix, entry.ident, entry.name))
         say("removed %d file(s)" % len(doomed))
-        if self.zone_id and self.purge_token and self.purge([self.url(ident, name) for ident, name in doomed]):
+        if self.zone_id and self.purge_token and self.purge([self.url(e.prefix, e.ident, e.name) for e in doomed]):
             say("and purged from Cloudflare's cache; a browser that already opened one may still show it")
         else:
             say("Cloudflare's cache may serve them for up to an hour")
@@ -555,7 +584,7 @@ def cmd_share(paths, wait, copy):
 
     store = open_store()
     live = store.upload(items, wait)
-    links = [store.url(ident, name) for _, ident, name, _ in items]
+    links = [store.url("f", ident, name) for _, ident, name, _ in items]
     if not live:
         say("share: the build is still running, so the links may not work for another minute")
     elif wait:
@@ -569,26 +598,33 @@ def cmd_share(paths, wait, copy):
 
 
 def cmd_list():
+    """Every file that is up, newest first, with when it went up, its size and its link; then the total."""
     store = open_store()
-    found = store.files()
+    found = sorted(store.files(), key=lambda entry: entry.modified, reverse=True)
     if not found:
         say("nothing is up")
-    for ident, name, size in found:
-        print("%s  %8s  %s" % (store.url(ident, name), human(size), ident))
+        return
+    for entry in found:
+        print("%s  %8s  %s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.modified)), human(entry.size),
+                               store.url(entry.prefix, entry.ident, entry.name)))
+    room = "R2's free tier holds 10 GB" if isinstance(store, Bucket) else "GitHub Pages holds about 1 GB"
+    say("%d file(s), %s in all; %s" % (len(found), human(sum(entry.size for entry in found)), room))
 
 
 def cmd_rm(targets, wait):
     store = open_store()
     found = store.files()
-    ids = set()
+    doomed = []
     for target in targets:
-        match = re.search(r"/f/([0-9a-f]{10})/", target)
-        key = match.group(1) if match else target
-        hits = {ident for ident, name, _ in found if key in (ident, name)}
+        match = re.search(r"/(f)/([0-9a-f]{10})/", target)
+        if match:
+            hits = [e for e in found if (e.prefix, e.ident) == match.groups()]
+        else:
+            hits = [e for e in found if target in (e.ident, e.name)]
         if not hits:
             die("nothing that is up matches %s" % target)
-        ids |= hits
-    store.remove([(ident, name) for ident, name, _ in found if ident in ids], wait)
+        doomed += [e for e in hits if e not in doomed]
+    store.remove(doomed, wait)
 
 
 def ask(prompt, default=""):
