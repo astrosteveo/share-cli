@@ -437,6 +437,59 @@ class Remove(unittest.TestCase):
             self.rm(["clip.mp4"], tty=True, answer="")
 
 
+class Expire(unittest.TestCase):
+    """--expire puts files in `<n>d/`, which a lifecycle rule on the bucket empties; the rule is added once, with cf."""
+
+    def tearDown(self):
+        share.config_path().unlink(missing_ok=True)
+
+    def test_days_are_read_with_or_without_the_d(self):
+        self.assertEqual(share.parse_days("7d"), 7)
+        self.assertEqual(share.parse_days("30"), 30)
+        for bad in ("0d", "7h", "-1", "d"):
+            with self.assertRaises(share.argparse.ArgumentTypeError):
+                share.parse_days(bad)
+
+    def test_expiring_keys_are_in_the_layout(self):
+        self.assertEqual(share.parse_key("7d/aaaaaaaaaa/a.png"), ("7d", "aaaaaaaaaa", "a.png"))
+        self.assertIsNone(share.parse_key("0d/aaaaaaaaaa/a.png"))
+        self.assertEqual(share.expiry_days("30d"), 30)
+        self.assertIsNone(share.expiry_days("f"))
+
+    def test_github_cannot_expire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            path.write_bytes(b"x")
+            with mock.patch.object(share, "say"), mock.patch.object(share, "Site") as site, self.assertRaises(SystemExit):
+                share.cmd_share([str(path)], wait=False, copy=False, expire=7)
+            site.assert_not_called()
+
+    def run_rule(self, existing):
+        write_config(CONFIG)
+        calls = []
+
+        def cf(cmd, **kwargs):
+            calls.append((cmd, kwargs["env"]["CLOUDFLARE_ACCOUNT_ID"]))
+            return mock.Mock(returncode=0, stdout=json.dumps({"rules": existing}) if "get" in cmd else "", stderr="")
+        config = dict(CONFIG)
+        with mock.patch.object(share.shutil, "which", return_value="/usr/bin/cf"), \
+                mock.patch.object(share.subprocess, "run", side_effect=cf), mock.patch.object(share, "say"):
+            share.expiry_rule(config, 7)
+            share.expiry_rule(config, 7)  # known now, so no second call
+        return calls
+
+    def test_the_rule_is_added_beside_the_rules_already_there_once(self):
+        other = {"id": "Default Multipart Abort Rule", "enabled": True, "conditions": {}}
+        calls = self.run_rule([other, {"id": "share-expire-7d", "enabled": False}])
+        self.assertEqual(len(calls), 2)
+        update, account = calls[1]
+        self.assertEqual(account, "acct")
+        rules = json.loads(update[update.index("--rules") + 1])
+        self.assertEqual(rules, [other, {"id": "share-expire-7d", "enabled": True, "conditions": {"prefix": "7d/"},
+                                         "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": 604800}}}])
+        self.assertEqual(share.r2_config()["expire_days"], [7])
+
+
 class Workflow(unittest.TestCase):
     def test_the_branch_goes_in_and_the_expressions_survive(self):
         text = share.WORKFLOW % "trunk"
