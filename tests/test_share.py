@@ -47,6 +47,11 @@ def write_config(config):
     return path
 
 
+def item(path, ident, digest, original=None):
+    """An upload of `path` under its own name, as cmd_share makes one."""
+    return share.Item(path, "f", ident, path.name, digest, path.stat().st_size, original or path.name)
+
+
 class CleanName(unittest.TestCase):
     def test_spaces_and_brackets_become_dashes(self):
         self.assertEqual(share.clean_name("My Clip (test).mp4"), "My-Clip-test.mp4")
@@ -261,12 +266,14 @@ class Bucket(unittest.TestCase):
             old.write_bytes(b"picture")
             bucket = self.bucket((404, b""), (200, b""), (200, b""))
             with mock.patch.object(share, "say"):
-                bucket.upload([(new, "aaaaaaaaaa", "clip.mp4", "d1"), (old, "bbbbbbbbbb", "pic.png", "d2")], wait=True)
+                bucket.upload([item(new, "aaaaaaaaaa", "d1", "My Clip é.mp4"), item(old, "bbbbbbbbbb", "d2")], wait=True)
         put = bucket.request.call_args_list[1]
         self.assertEqual(put.args, ("PUT", "f/aaaaaaaaaa/clip.mp4"))
         self.assertEqual(put.kwargs["digest"], "d1")
         self.assertEqual(put.kwargs["headers"]["content-type"], "video/mp4")
         self.assertEqual(put.kwargs["headers"]["content-length"], "5")
+        self.assertEqual(put.kwargs["headers"]["content-disposition"],
+                         "inline; filename=\"clip.mp4\"; filename*=UTF-8''My%20Clip%20%C3%A9.mp4")
         self.assertEqual(bucket.request.call_args_list[2].args, ("HEAD", "f/bbbbbbbbbb/pic.png"))
         self.assertEqual(bucket.request.call_count, 3)
 
@@ -312,7 +319,7 @@ class Purge(unittest.TestCase):
             new.write_bytes(b"n")
             old.write_bytes(b"o")
             with mock.patch.object(share, "say"):
-                bucket.upload([(new, "aaaaaaaaaa", "new.png", "d1"), (old, "bbbbbbbbbb", "old.png", "d2")], wait=True)
+                bucket.upload([item(new, "aaaaaaaaaa", "d1"), item(old, "bbbbbbbbbb", "d2")], wait=True)
         bucket.purge.assert_called_once_with(["https://share.example.com/f/aaaaaaaaaa/new.png"])
 
     def test_a_refused_purge_only_warns(self):
@@ -321,6 +328,39 @@ class Purge(unittest.TestCase):
         bucket, urlopen, said = self.remove(dict(CONFIG, zone_id="zone", purge_token="tok"), 1, purge_error=error)
         self.assertIn("10000 Authentication error", said[-2])
         self.assertIn("up to an hour", said[-1])
+
+
+class Remove(unittest.TestCase):
+    """--rm finds what each target names, and asks before one target takes down several files."""
+
+    FILES = [share.Entry("f", "aaaaaaaaaa", "clip.mp4", 1, 0), share.Entry("f", "bbbbbbbbbb", "clip.mp4", 1, 0),
+             share.Entry("f", "cccccccccc", "pic.png", 1, 0)]
+
+    def rm(self, targets, yes=False, tty=False, answer=""):
+        store = mock.Mock()
+        store.files.return_value = self.FILES
+        store.url.side_effect = lambda prefix, ident, name: "https://x/%s/%s/%s" % (prefix, ident, name)
+        with mock.patch.object(share, "open_store", return_value=store), mock.patch.object(share, "say"), \
+                mock.patch.object(share.sys.stdin, "isatty", return_value=tty), \
+                mock.patch("builtins.input", return_value=answer):
+            share.cmd_rm(targets, wait=False, yes=yes)
+        return store.remove.call_args.args[0]
+
+    def test_a_link_an_id_and_a_unique_name_each_take_one_file(self):
+        doomed = self.rm(["https://x/f/aaaaaaaaaa/clip.mp4", "bbbbbbbbbb", "pic.png"])
+        self.assertEqual(doomed, self.FILES)
+
+    def test_a_name_that_matches_two_files_is_refused_without_a_terminal(self):
+        with self.assertRaises(SystemExit):
+            self.rm(["clip.mp4"])
+
+    def test_yes_takes_every_match(self):
+        self.assertEqual(self.rm(["clip.mp4"], yes=True), self.FILES[:2])
+
+    def test_the_question_takes_every_match_on_y_and_nothing_otherwise(self):
+        self.assertEqual(self.rm(["clip.mp4"], tty=True, answer="y"), self.FILES[:2])
+        with self.assertRaises(SystemExit):
+            self.rm(["clip.mp4"], tty=True, answer="")
 
 
 class Workflow(unittest.TestCase):
