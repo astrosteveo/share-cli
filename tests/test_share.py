@@ -546,22 +546,29 @@ class StripPng(unittest.TestCase):
 
 
 class StripMetadata(unittest.TestCase):
-    def strip(self, name, data, exiftool=False):
+    MOV = {"format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"}, "streams": [{"codec_type": "video"}]}
+
+    def strip(self, name, data, exiftool=False, ffmpeg=False, info=MOV):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path, folder = Path(tmp.name) / name, Path(tmp.name) / "out"
         path.write_bytes(data)
         folder.mkdir()
         said = []
-        with mock.patch.object(share, "exiftool_writes", return_value={".jpg", ".mov"} if exiftool else set()), \
-                mock.patch.object(share, "run") as run, mock.patch.object(share, "say", side_effect=said.append), \
-                mock.patch.object(share.shutil, "which", return_value="/usr/bin/exiftool" if exiftool else None):
-            run.side_effect = lambda cmd, check: (Path(cmd[-2]).write_bytes(b"clean"), mock.Mock(returncode=0))[1]
+        tools = (["exiftool"] if exiftool else []) + (["ffmpeg", "ffprobe"] if ffmpeg else [])
+
+        def run(cmd, check):  # exiftool ends with "-o TARGET PATH", ffmpeg with TARGET
+            Path(cmd[-1] if cmd[0] == "ffmpeg" else cmd[-2]).write_bytes(b"clean")
+            return mock.Mock(returncode=0)
+        with mock.patch.object(share, "exiftool_writes", return_value={".jpg", ".mov", ".nef"} if exiftool else set()), \
+                mock.patch.object(share, "run", side_effect=run) as ran, mock.patch.object(share, "probe", return_value=info), \
+                mock.patch.object(share, "say", side_effect=said.append), \
+                mock.patch.object(share.shutil, "which", side_effect=lambda tool: tool if tool in tools else None):
             out = share.strip_metadata(path, folder)
-        return path, out, run, said
+        return path, out, ran, said
 
     def test_exiftool_strips_what_it_can_write_and_keeps_orientation_and_colour(self):
-        path, out, run, _ = self.strip("clip.mov", b"video", exiftool=True)
+        path, out, run, _ = self.strip("pic.jpg", b"picture", exiftool=True)
         self.assertEqual(out.read_bytes(), b"clean")
         command = run.call_args.args[0]
         self.assertEqual(command[:3], ["exiftool", "-q", "-q"])
@@ -583,6 +590,44 @@ class StripMetadata(unittest.TestCase):
             path, out, run, _ = self.strip(name, b"<svg/>")
             self.assertEqual(out, path)
             run.assert_not_called()
+
+    def test_a_raw_photo_loses_its_place_and_says_it_keeps_its_date_and_camera(self):
+        path, out, run, said = self.strip("DSC_0059.NEF", b"raw", exiftool=True)
+        self.assertEqual(out.read_bytes(), b"clean")
+        self.assertIn("keeps its date and camera", said[0])
+        path, out, _, said = self.strip("IMG_1.CR2", b"raw")
+        self.assertEqual(out, path)
+        self.assertIn("install exiftool", said[0])
+
+    def test_a_video_keeps_only_its_picture_and_sound(self):
+        path, out, run, _ = self.strip("drone.mov", b"video", exiftool=True, ffmpeg=True)
+        self.assertEqual(out.read_bytes(), b"clean")
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "ffmpeg")
+        self.assertEqual(command[command.index("-f") + 1], "mov")
+        self.assertEqual(command[command.index("-protocol_whitelist") + 1], "file")
+        self.assertEqual([command[i + 1] for i, a in enumerate(command) if a == "-map"], ["0:v", "0:a?"])
+        self.assertEqual(command[command.index("-c") + 1], "copy")
+        self.assertEqual(command[command.index("-map_metadata") + 1], "-1")
+        self.assertNotIn("-bsf:v:0", command)
+
+    def test_a_camcorder_video_loses_the_sei_messages_in_its_h264(self):
+        info = {"format": {"format_name": "mpegts"}, "streams": [{"codec_type": "video", "codec_name": "h264"}]}
+        path, out, run, _ = self.strip("00001.MTS", b"video", ffmpeg=True, info=info)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-bsf:v:0") + 1], "filter_units=remove_types=6")
+
+    def test_a_playlist_named_like_a_video_is_refused(self):
+        for found in ("concat", "dash", "hls", ""):
+            with self.assertRaises(SystemExit):
+                self.strip("funny.mov", b"ffconcat version 1.0\nfile private.mov\n", ffmpeg=True,
+                           info={"format": {"format_name": found}})
+
+    def test_a_video_without_ffmpeg_goes_up_as_it_is_with_a_note(self):
+        path, out, run, said = self.strip("clip.mov", b"video", exiftool=True)
+        self.assertEqual(out, path)
+        run.assert_not_called()
+        self.assertIn("install ffmpeg", said[0])
 
 
 class Inputs(unittest.TestCase):
@@ -634,7 +679,7 @@ class Inputs(unittest.TestCase):
 class Mp4(unittest.TestCase):
     """--mp4 asks ffprobe what a video holds and converts only what browsers may not play."""
 
-    def convert(self, name, streams):
+    def convert(self, name, streams, kind="mov,mp4,m4a,3gp,3g2,mj2"):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = Path(tmp.name) / name
@@ -642,7 +687,7 @@ class Mp4(unittest.TestCase):
         process = mock.Mock(stdout=iter(["out_time_us=1000000\n"]), stderr=io.StringIO(""))
         process.wait.return_value = 0
         with mock.patch.object(share.shutil, "which", return_value="/usr/bin/ffmpeg"), \
-                mock.patch.object(share, "probe", return_value={"streams": streams, "format": {"duration": "2"}}), \
+                mock.patch.object(share, "probe", return_value={"streams": streams, "format": {"duration": "2", "format_name": kind}}), \
                 mock.patch.object(share.subprocess, "Popen", return_value=process) as popen, mock.patch.object(share, "say"):
             out = share.to_mp4(path, Path(tmp.name))
         return out, popen.call_args.args[0] if popen.called else None
@@ -665,6 +710,15 @@ class Mp4(unittest.TestCase):
         self.assertEqual(command[command.index("-c:a") + 1], "aac")
         self.assertIn("+faststart", command)
         self.assertEqual(command[command.index("-map_metadata") + 1], "-1")
+
+    def test_a_playlist_named_like_a_video_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.convert("funny.mov", [self.H264], kind="concat")
+
+    def test_the_format_ffprobe_found_is_the_one_ffmpeg_reads(self):
+        out, command = self.convert("clip.mkv", [self.HEVC, self.AAC], kind="matroska,webm")
+        self.assertEqual(command[command.index("-f") + 1], "matroska")
+        self.assertEqual(command[command.index("-protocol_whitelist") + 1], "file")
 
     def test_hevc_is_encoded_to_h264_at_an_even_size(self):
         out, command = self.convert("clip.mkv", [self.HEVC, self.AAC])

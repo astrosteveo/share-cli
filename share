@@ -26,8 +26,9 @@ link.
 Things to know:
   * Anyone with a link can open the file, and anyone can browse the GitHub repo. Never share what
     you would not post openly.
-  * Pictures and videos go up without where, when and on what they were taken (with exiftool for
-    every format it knows, else for JPEG and PNG only). --keep-metadata leaves them as they are.
+  * Pictures and videos go up without where, when and on what they were taken: pictures with
+    exiftool for every format it knows, else JPEG and PNG only, and videos with ffmpeg. A RAW photo
+    keeps its date and camera, which raw converters need. --keep-metadata leaves files as they are.
   * Browsers play mp4 (H.264) and webm inline; .mov, .mkv and .avi may download instead. --mp4
     converts them with ffmpeg first.
   * --rm on R2 deletes the file at once. With a Cache Purge token in the settings it also clears
@@ -86,6 +87,14 @@ USER_AGENT = {"User-Agent": "share-cli"}
 WARN_BYTES = 50 * 1024 * 1024
 BUILD_TIMEOUT = 180
 OTHER_VIDEO = {".mov", ".mkv", ".avi", ".wmv", ".flv"}
+# Pictures and videos Python's own list of types does not know: camera RAW photos and camcorder (AVCHD) video.
+RAW_PHOTOS = {".3fr", ".arw", ".cr2", ".cr3", ".crw", ".dng", ".erf", ".gpr", ".iiq", ".mef", ".mos", ".mrw",
+              ".nef", ".nrw", ".orf", ".pef", ".raf", ".rw2", ".rwl", ".sr2", ".srw", ".x3f"}
+CAMERA_VIDEO = {".mts", ".m2ts"}
+# The formats ffmpeg may read a video as, by the first name ffprobe gives: files that hold their own streams.
+# ffmpeg goes by what is in a file, not its name, and a playlist or manifest named .mov would make it read the
+# other files it lists, so another video of yours could go up in its place.
+VIDEO_FORMATS = {"mov", "matroska", "avi", "mpegts", "mpeg", "flv", "asf", "ogg", "mxf"}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # PNG chunks that hold words, dates or Exif rather than the picture.
 PNG_DROP = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"tIME"}
@@ -847,20 +856,62 @@ def exiftool_writes():
     return exiftool_writes.found
 
 
+def media_kind(path):
+    """"image" or "video" for a picture or video by its name, else None. An SVG is no picture here: it is a page
+    that can hold scripts, and has no camera metadata."""
+    suffix = path.suffix.lower()
+    if suffix in RAW_PHOTOS:
+        return "image"
+    if suffix in CAMERA_VIDEO:
+        return "video"
+    kind = mimetypes.guess_type(path.name)[0] or ""
+    if kind == "image/svg+xml" or kind.split("/")[0] not in ("image", "video"):
+        return None
+    return kind.split("/")[0]
+
+
+def strip_video(path, target):
+    """Copy a video's picture and sound to `target` and nothing else: no metadata, so no place, camera or dates
+    (the file's own times come out as zero), and no other tracks, such as the GPS route drones and action
+    cameras record beside the video. Camcorders keep the time and place inside the H.264 stream, in SEI
+    messages, which go too. Rotation stays, and nothing is encoded again."""
+    info, read = open_video(path)
+    command = ["ffmpeg", "-nostdin", "-v", "error", "-y"] + read + [
+        "-map", "0:v", "-map", "0:a?", "-c", "copy", "-map_metadata", "-1", "-map_chapters", "-1",
+        "-fflags", "+bitexact"]
+    videos = [s for s in info.get("streams") or [] if s.get("codec_type") == "video"]
+    if info["format"]["format_name"] == "mpegts":
+        command += sum((["-bsf:v:%d" % n, "filter_units=remove_types=6"]
+                        for n, s in enumerate(videos) if s.get("codec_name") == "h264"), [])
+    if target.suffix.lower() in (".mp4", ".m4v", ".mov"):
+        command += ["-movflags", "+faststart"]
+    done = run(command + [str(target)], check=False)
+    if done.returncode or not target.exists():
+        die("ffmpeg could not strip %s: %s\n--keep-metadata puts it up as it is" % (path.name, done.stderr.strip()))
+
+
 def strip_metadata(path, folder):
     """A copy of a picture or video without where and when it was taken or on what, in `folder`; the file itself
-    if it has nothing to strip or nothing here can strip it. exiftool when it is installed, which knows nearly
-    every format, else the JPEG and PNG stripping above."""
-    kind = mimetypes.guess_type(path.name)[0] or ""
-    if kind.split("/")[0] not in ("image", "video") or kind == "image/svg+xml":
+    if it has nothing to strip or nothing here can strip it. Videos go through ffmpeg. Pictures go through
+    exiftool when it is installed, which knows nearly every format, else the JPEG and PNG stripping above."""
+    kind = media_kind(path)
+    if not kind:
         return path
     target = folder / path.name
+    if kind == "video":
+        if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+            say("note: %s keeps its metadata, such as where it was taken; install ffmpeg to strip it" % path.name)
+            return path
+        strip_video(path, target)
+        return target
     if path.suffix.lower() in exiftool_writes():
         done = run(["exiftool", "-q", "-q", "-all=", "--icc_profile:all", "-tagsfromfile", "@", "-colorspacetags",
                     "-orientation", "-o", str(target), str(path)], check=False)
         if done.returncode or not target.exists():
             die("exiftool could not strip %s: %s\n--keep-metadata puts it up as it is"
                 % (path.name, (done.stderr or done.stdout).strip()))
+        if path.suffix.lower() in RAW_PHOTOS:  # exiftool will not delete what raw converters need to read them
+            say("note: %s goes up without its place, but a RAW photo keeps its date and camera" % path.name)
         return target
     strip = {".jpg": strip_jpeg, ".jpeg": strip_jpeg, ".png": strip_png}.get(path.suffix.lower())
     if not strip:
@@ -875,24 +926,36 @@ def strip_metadata(path, folder):
 
 
 def probe(path):
-    """What ffprobe says about a video's streams and length, or {}."""
-    done = run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)], check=False)
+    """What ffprobe says about a video's format, streams and length, or {}. It may open local files only, so a
+    playlist cannot make it fetch a URL."""
+    done = run(["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-show_streams", "-show_format",
+                "-of", "json", str(path)], check=False)
     try:
         return json.loads(done.stdout or "{}")
     except ValueError:
         return {}
 
 
+def open_video(path):
+    """What ffprobe says about a video, and the ffmpeg arguments that read it in the format ffprobe found. Stops
+    if that is no format in VIDEO_FORMATS, such as a playlist made to look like a video."""
+    info = probe(path)
+    found = (info.get("format") or {}).get("format_name") or ""
+    if found.split(",")[0] not in VIDEO_FORMATS:
+        die("%s is not a video file ffmpeg should read (ffprobe reads it as %s)\n"
+            "--keep-metadata, without --mp4, puts it up as it is" % (path.name, found or "nothing"))
+    return info, ["-protocol_whitelist", "file", "-f", found.split(",")[0], "-i", str(path)]
+
+
 def to_mp4(path, folder):
     """An mp4 of a video in `folder` that every browser plays inline: H.264 in 4:2:0 with AAC sound, its index at
     the start so it plays while it loads, and no metadata. A stream that already fits is copied, not encoded
     again. None when the file is no video or already plays as it is."""
-    kind = mimetypes.guess_type(path.name)[0] or ""
-    if not kind.startswith("video/") or path.suffix.lower() == ".webm":
+    if media_kind(path) != "video" or path.suffix.lower() == ".webm":
         return None
     if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
         die("--mp4 needs ffmpeg; install it with your package manager")
-    info = probe(path)
+    info, read = open_video(path)
     streams = info.get("streams") or []
     video = next((s for s in streams if s.get("codec_type") == "video"
                   and not (s.get("disposition") or {}).get("attached_pic")), None)
@@ -904,8 +967,8 @@ def to_mp4(path, folder):
     if path.suffix.lower() in (".mp4", ".m4v") and video_ok and audio_ok:
         return None
     target = folder / (path.stem + ".mp4")
-    command = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?",
-               "-map_metadata", "-1", "-map_chapters", "-1"]
+    command = ["ffmpeg", "-nostdin", "-v", "error", "-y"] + read + ["-map", "0:v:0", "-map", "0:a:0?",
+                                                                    "-map_metadata", "-1", "-map_chapters", "-1"]
     command += ["-c:v", "copy"] if video_ok else [
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]  # 4:2:0 needs an even width and height
