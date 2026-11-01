@@ -34,9 +34,9 @@ Things to know:
   * --rm on R2 deletes the file at once. With a Cache Purge token in the settings it also clears
     Cloudflare's cache, so the link stops working at once; without one the cache may serve the file
     for up to an hour. A browser that already opened it may keep showing it either way.
-    On GitHub it rewrites the repo into one fresh commit and force-pushes, so the file leaves the
-    history and stops counting toward the 1 GB, but GitHub may still serve the old commit by its
-    SHA until it cleans up. Anything truly sensitive should not go up at all.
+    On GitHub it rewrites the repo's history without the file and force-pushes, so the file
+    stops counting toward the 1 GB, but GitHub may still serve the old commits by their SHA until
+    it cleans up. Anything truly sensitive should not go up at all.
 
 Links go to stdout, everything else to stderr, so `share clip.mp4 | wl-copy` works. On Wayland the
 links are also copied to the clipboard.
@@ -88,6 +88,7 @@ WARN_BYTES = 50 * 1024 * 1024
 BUILD_TIMEOUT = 180
 OTHER_VIDEO = {".mov", ".mkv", ".avi", ".wmv", ".flv"}
 # Pictures and videos Python's own list of types does not know: camera RAW photos and camcorder (AVCHD) video.
+# Dashcam .ts video shares its extension with TypeScript, so media_kind looks at its bytes.
 RAW_PHOTOS = {".3fr", ".arw", ".cr2", ".cr3", ".crw", ".dng", ".erf", ".gpr", ".iiq", ".mef", ".mos", ".mrw",
               ".nef", ".nrw", ".orf", ".pef", ".raf", ".rw2", ".rwl", ".sr2", ".srw", ".x3f"}
 CAMERA_VIDEO = {".mts", ".m2ts"}
@@ -496,7 +497,7 @@ class Site:
     def files(self):
         """Every file that is up, as Entry, in name order. A file went up with the newest commit that touched it."""
         added, stamp = {}, 0
-        for line in git(self.clone, "log", "--format=%ct", "--name-only", "--", "f").stdout.splitlines():
+        for line in git(self.clone, "log", "--format=%at", "--name-only", "--", "f").stdout.splitlines():
             if line.startswith("f/"):
                 added.setdefault(line, stamp)
             elif line.strip():
@@ -526,11 +527,22 @@ class Site:
 
     def remove(self, doomed, wait):
         """Takes these files (Entry) down, from the history too."""
+        kept = {}
+        for entry in self.files():
+            if entry not in doomed:
+                kept.setdefault(entry.modified or int(time.time()), []).append(
+                    "%s/%s/%s" % (entry.prefix, entry.ident, entry.name))
         for entry in doomed:
             git(self.clone, "rm", "-q", "%s/%s/%s" % (entry.prefix, entry.ident, entry.name))
-        # One fresh commit of what is left, so the removed bytes leave the branch history too.
+        # A fresh history of what is left, so the removed bytes leave the branch too: one commit for the site, then
+        # one per upload time, dated then, so --list still knows when each file went up.
         git(self.clone, "checkout", "-q", "--orphan", "_rewrite")
-        git(self.clone, "commit", "-q", "-m", "share files")
+        git(self.clone, "rm", "-r", "-q", "--cached", "f", check=False)
+        git(self.clone, "commit", "-q", "--allow-empty", "-m", "share files")
+        for stamp in sorted(kept):
+            git(self.clone, "add", *kept[stamp])
+            git(self.clone, "commit", "-q", "--date=@%d" % stamp, "-m", "add " + ", ".join(
+                path.rsplit("/", 1)[1] for path in kept[stamp])[:120])
         git(self.clone, "branch", "-q", "-M", self.branch)
         pushed = git(self.clone, "push", "-q", "-f", "origin", self.branch, check=False)
         if pushed.returncode:
@@ -625,6 +637,7 @@ class Bucket:
 
     def upload(self, items, wait):
         """Puts each file that is not up yet, a few at a time. Always True: there is no build to wait for."""
+        items = list({self.key(item): item for item in items}.values())  # the same file named twice goes up once
         heads = in_parallel(lambda item: self.request("HEAD", self.key(item)), items)
         new = [item for item, head in zip(items, heads) if head[0] == 404]
         for item, (status, _, headers) in zip(items, heads):
@@ -857,17 +870,30 @@ def exiftool_writes():
 
 
 def media_kind(path):
-    """"image" or "video" for a picture or video by its name, else None. An SVG is no picture here: it is a page
+    """"image" or "video" for a picture or video by its name (and, for .ts, its first bytes), else None. An SVG is no picture here: it is a page
     that can hold scripts, and has no camera metadata."""
     suffix = path.suffix.lower()
     if suffix in RAW_PHOTOS:
         return "image"
     if suffix in CAMERA_VIDEO:
         return "video"
+    if suffix == ".ts":  # MPEG-TS video, as dashcams record, or TypeScript: a sync byte every 188 bytes says video
+        with open(path, "rb") as handle:
+            head = handle.read(189)
+        return "video" if head[:1] == head[188:189] == b"\x47" else None
     kind = mimetypes.guess_type(path.name)[0] or ""
     if kind == "image/svg+xml" or kind.split("/")[0] not in ("image", "video"):
         return None
     return kind.split("/")[0]
+
+
+def without_sei(info, videos):
+    """The ffmpeg arguments that drop the SEI messages from each H.264 stream copied out of an MPEG-TS file, where
+    camcorders and dashcams keep the time and place. `videos` are the video streams in the order they go out."""
+    if (info.get("format") or {}).get("format_name") != "mpegts":
+        return []
+    return sum((["-bsf:v:%d" % n, "filter_units=remove_types=6"]
+                for n, stream in enumerate(videos) if stream.get("codec_name") == "h264"), [])
 
 
 def strip_video(path, target):
@@ -877,12 +903,9 @@ def strip_video(path, target):
     messages, which go too. Rotation stays, and nothing is encoded again."""
     info, read = open_video(path)
     command = ["ffmpeg", "-nostdin", "-v", "error", "-y"] + read + [
-        "-map", "0:v", "-map", "0:a?", "-c", "copy", "-map_metadata", "-1", "-map_chapters", "-1",
+        "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-map_metadata", "-1", "-map_chapters", "-1",
         "-fflags", "+bitexact"]
-    videos = [s for s in info.get("streams") or [] if s.get("codec_type") == "video"]
-    if info["format"]["format_name"] == "mpegts":
-        command += sum((["-bsf:v:%d" % n, "filter_units=remove_types=6"]
-                        for n, s in enumerate(videos) if s.get("codec_name") == "h264"), [])
+    command += without_sei(info, [s for s in info.get("streams") or [] if s.get("codec_type") == "video"])
     if target.suffix.lower() in (".mp4", ".m4v", ".mov"):
         command += ["-movflags", "+faststart"]
     done = run(command + [str(target)], check=False)
@@ -967,9 +990,9 @@ def to_mp4(path, folder):
     if path.suffix.lower() in (".mp4", ".m4v") and video_ok and audio_ok:
         return None
     target = folder / (path.stem + ".mp4")
-    command = ["ffmpeg", "-nostdin", "-v", "error", "-y"] + read + ["-map", "0:v:0", "-map", "0:a:0?",
+    command = ["ffmpeg", "-nostdin", "-v", "error", "-y"] + read + ["-map", "0:%d" % video["index"], "-map", "0:a:0?",
                                                                     "-map_metadata", "-1", "-map_chapters", "-1"]
-    command += ["-c:v", "copy"] if video_ok else [
+    command += ["-c:v", "copy"] + without_sei(info, [video]) if video_ok else [
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
         "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]  # 4:2:0 needs an even width and height
     command += ["-c:a", "copy"] if audio_ok else ["-c:a", "aac", "-b:a", "160k"]
@@ -977,12 +1000,15 @@ def to_mp4(path, folder):
     say("converting %s to mp4%s" % (path.name, " (copying the video, which plays already)" if video_ok else ""))
     length = float((info.get("format") or {}).get("duration") or 0)
     show = length > 0 and sys.stderr.isatty()
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    for line in process.stdout:
-        if show and line.startswith("out_time_us=") and line[12:].strip().isdigit():
-            sys.stderr.write("\r%3d%%\033[K" % min(100, int(line[12:]) / 1e6 / length * 100))
-            sys.stderr.flush()
-    error = process.stderr.read()
+    with tempfile.TemporaryFile("w+") as errors:  # not a pipe: a damaged file's errors could fill one and stall ffmpeg
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True)
+        for line in process.stdout:
+            if show and line.startswith("out_time_us=") and line[12:].strip().isdigit():
+                sys.stderr.write("\r%3d%%\033[K" % min(100, int(line[12:]) / 1e6 / length * 100))
+                sys.stderr.flush()
+        process.wait()
+        errors.seek(0)
+        error = errors.read()
     if show:
         sys.stderr.write("\r\033[K")
     if process.wait():
@@ -998,8 +1024,13 @@ def sniff_suffix(head):
             return suffix
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return ".webp"
-    if head[4:8] == b"ftyp":
-        return ".mov" if head[8:12] == b"qt  " else ".mp4"
+    if head[4:8] == b"ftyp":  # the ISO family: the brands after it say photo, sound or video
+        brands = head[8:12] + head[16:32]
+        if b"avif" in brands or b"avis" in brands:
+            return ".avif"
+        if head[8:12] in (b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1"):
+            return ".heic"
+        return {b"qt  ": ".mov", b"M4A ": ".m4a"}.get(head[8:12], ".mp4")
     try:
         codecs.getincrementaldecoder("utf-8")().decode(head)
     except UnicodeDecodeError:
@@ -1150,7 +1181,7 @@ def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata
             if size == 0:
                 die("%s is empty" % path)
             # --mp4 may bring a video under the limit, so that waits until it is converted.
-            if size > limit and not (mp4 and (mimetypes.guess_type(path.name)[0] or "").startswith("video/")):
+            if size > limit and not (mp4 and media_kind(path) == "video"):
                 too_big(size, path.name)
         items = []
         for number, path in enumerate(sources):
@@ -1210,7 +1241,7 @@ def cmd_rm(targets, wait, yes=False):
     """Takes down what each target names. A target that names more than one file asks first, unless `yes`."""
     store = open_store()
     found = store.files()
-    doomed = []
+    doomed, several = [], False
     for target in targets:
         match = re.search(r"/(f|[1-9][0-9]*d)/([0-9a-f]{10})/", target)
         if match:
@@ -1220,7 +1251,8 @@ def cmd_rm(targets, wait, yes=False):
         if not hits:
             die("nothing that is up matches %s" % target)
         doomed += [e for e in hits if e not in doomed]
-    if len(doomed) > len(targets) and not yes:
+        several = several or len(hits) > 1
+    if several and not yes:
         say("that matches %d files:" % len(doomed))
         for entry in doomed:
             say("  " + store.url(entry.prefix, entry.ident, entry.name))

@@ -87,7 +87,8 @@ pictures some phones add after the end. Other formats then go up as they are, wi
 `ffmpeg` strips a video by copying its picture and sound into a new file, encoding nothing again.
 Everything else stays behind: metadata, the file's dates (they come out as zero), and other
 tracks, such as the GPS route drones and action cameras record beside the video. Camcorder
-`.mts` files keep the time and place inside the H.264 stream, in SEI messages, and those go too.
+`.mts` and dashcam `.ts` files keep the time and place inside the H.264 stream, in SEI messages,
+and those go too, with `--mp4` as well.
 The rotation stays. Without `ffmpeg`, a video goes up as it is, with a note.
 
 `--mp4` also runs `ffmpeg`. A video stream that is already H.264 is copied rather than encoded
@@ -162,8 +163,8 @@ than the file's own hour).
 
 **GitHub:** 100 MB a file (git refuses more) and about 1 GB for the whole site. Pages' limit of 10
 builds an hour does not apply to a site deployed by its own workflow. The repo is public: anyone
-can browse it. `--rm` rewrites the repo into one commit and force-pushes, but GitHub may serve the
-old commit by its SHA for a while.
+can browse it. `--rm` rewrites the repo's history without the file and force-pushes, keeping
+the date each other file went up, but GitHub may serve the old commits by their SHA for a while.
 
 ## Tests
 
