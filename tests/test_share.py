@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -110,6 +111,15 @@ class RefusesBeforeUploading(unittest.TestCase):
             with open(big, "wb") as handle:
                 handle.truncate(share.MAX_BYTES + 1)  # sparse, so it costs no disk
             self.refused(big)
+
+    def test_mp4_gets_to_shrink_a_big_camcorder_video_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp) / "big.m2ts"
+            with open(big, "wb") as handle:
+                handle.truncate(share.MAX_BYTES + 1)
+            with mock.patch.object(share, "to_mp4", side_effect=SystemExit("converting")):
+                with self.assertRaisesRegex(SystemExit, "converting"):
+                    share.cmd_share([str(big)], wait=False, copy=False, mp4=True)
 
     def test_a_file_over_5_gb_when_r2_is_set_up(self):
         write_config(CONFIG)
@@ -295,6 +305,15 @@ class Bucket(unittest.TestCase):
         self.assertEqual(put.kwargs["headers"]["content-disposition"],
                          "inline; filename=\"clip.mp4\"; filename*=UTF-8''My%20Clip%20%C3%A9.mp4")
 
+    def test_the_same_file_named_twice_goes_up_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp) / "clip.mp4"
+            clip.write_bytes(b"video")
+            bucket = self.answering(lambda method, key, query: (404 if method == "HEAD" else 200, b"", {}))
+            with mock.patch.object(share, "say"):
+                bucket.upload([item(clip, "aaaaaaaaaa", "d1"), item(clip, "aaaaaaaaaa", "d1")], wait=True)
+        self.assertEqual(len(self.calls(bucket, "PUT")), 1)
+
     def test_links_use_the_public_url(self):
         self.assertEqual(share.Bucket(CONFIG).url("f", "aaaaaaaaaa", "a.png"), "https://share.example.com/f/aaaaaaaaaa/a.png")
 
@@ -427,6 +446,10 @@ class Remove(unittest.TestCase):
     def test_a_name_that_matches_two_files_is_refused_without_a_terminal(self):
         with self.assertRaises(SystemExit):
             self.rm(["clip.mp4"])
+
+    def test_a_name_that_matches_two_files_asks_even_beside_another_target(self):
+        with self.assertRaises(SystemExit):
+            self.rm(["clip.mp4", "aaaaaaaaaa"])
 
     def test_yes_takes_every_match(self):
         self.assertEqual(self.rm(["clip.mp4"], yes=True), self.FILES[:2])
@@ -606,7 +629,7 @@ class StripMetadata(unittest.TestCase):
         self.assertEqual(command[0], "ffmpeg")
         self.assertEqual(command[command.index("-f") + 1], "mov")
         self.assertEqual(command[command.index("-protocol_whitelist") + 1], "file")
-        self.assertEqual([command[i + 1] for i, a in enumerate(command) if a == "-map"], ["0:v", "0:a?"])
+        self.assertEqual([command[i + 1] for i, a in enumerate(command) if a == "-map"], ["0:v?", "0:a?"])
         self.assertEqual(command[command.index("-c") + 1], "copy")
         self.assertEqual(command[command.index("-map_metadata") + 1], "-1")
         self.assertNotIn("-bsf:v:0", command)
@@ -616,6 +639,14 @@ class StripMetadata(unittest.TestCase):
         path, out, run, _ = self.strip("00001.MTS", b"video", ffmpeg=True, info=info)
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("-bsf:v:0") + 1], "filter_units=remove_types=6")
+
+    def test_a_ts_file_is_video_only_when_its_bytes_are_mpeg_ts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video, code = Path(tmp) / "dashcam.ts", Path(tmp) / "app.ts"
+            video.write_bytes((b"\x47" + bytes(187)) * 2)
+            code.write_text("export const x = 1;\n" * 20)
+            self.assertEqual(share.media_kind(video), "video")
+            self.assertIsNone(share.media_kind(code))
 
     def test_a_playlist_named_like_a_video_is_refused(self):
         for found in ("concat", "dash", "hls", ""):
@@ -638,6 +669,10 @@ class Inputs(unittest.TestCase):
         self.assertEqual(share.sniff_suffix(b"\xff\xd8\xff\xe0"), ".jpg")
         self.assertEqual(share.sniff_suffix(b"\0\0\0\x20ftypisom"), ".mp4")
         self.assertEqual(share.sniff_suffix(b"\0\0\0\x14ftypqt  "), ".mov")
+        self.assertEqual(share.sniff_suffix(b"\0\0\0\x18ftypheix\0\0\0\0mif1heix"), ".heic")
+        self.assertEqual(share.sniff_suffix(b"\0\0\0\x1cftypavif\0\0\0\0mif1avifmiaf"), ".avif")
+        self.assertEqual(share.sniff_suffix(b"\0\0\0\x1cftypmif1\0\0\0\0mif1avifmiaf"), ".avif")
+        self.assertEqual(share.sniff_suffix(b"\0\0\0\x1cftypM4A \0\0\0\0M4A isom"), ".m4a")
         self.assertEqual(share.sniff_suffix(b"RIFF\0\0\0\0WEBPVP8 "), ".webp")
         self.assertEqual(share.sniff_suffix("# notes, café".encode()), ".txt")
         self.assertEqual(share.sniff_suffix(b"\x00\x01\x02"), ".bin")
@@ -680,6 +715,7 @@ class Mp4(unittest.TestCase):
     """--mp4 asks ffprobe what a video holds and converts only what browsers may not play."""
 
     def convert(self, name, streams, kind="mov,mp4,m4a,3gp,3g2,mj2"):
+        streams = [dict(stream, index=n) for n, stream in enumerate(streams)]
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = Path(tmp.name) / name
@@ -690,6 +726,7 @@ class Mp4(unittest.TestCase):
                 mock.patch.object(share, "probe", return_value={"streams": streams, "format": {"duration": "2", "format_name": kind}}), \
                 mock.patch.object(share.subprocess, "Popen", return_value=process) as popen, mock.patch.object(share, "say"):
             out = share.to_mp4(path, Path(tmp.name))
+        self.popen_kwargs = popen.call_args.kwargs if popen.called else None
         return out, popen.call_args.args[0] if popen.called else None
 
     H264 = {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p"}
@@ -715,6 +752,19 @@ class Mp4(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.convert("funny.mov", [self.H264], kind="concat")
 
+    def test_the_video_it_chose_is_the_one_it_maps_even_after_a_cover(self):
+        cover = {"codec_type": "video", "codec_name": "png", "disposition": {"attached_pic": 1}}
+        out, command = self.convert("phone.mov", [cover, self.H264, self.AAC])
+        self.assertEqual(command[command.index("-map") + 1], "0:1")
+
+    def test_h264_copied_out_of_mpeg_ts_loses_its_sei(self):
+        out, command = self.convert("00001.MTS", [self.H264, self.AAC], kind="mpegts")
+        self.assertEqual(command[command.index("-bsf:v:0") + 1], "filter_units=remove_types=6")
+
+    def test_ffmpeg_errors_go_to_a_file_not_a_pipe(self):
+        out, command = self.convert("clip.mkv", [self.HEVC, self.AAC], kind="matroska,webm")
+        self.assertNotEqual(self.popen_kwargs["stderr"], share.subprocess.PIPE)
+
     def test_the_format_ffprobe_found_is_the_one_ffmpeg_reads(self):
         out, command = self.convert("clip.mkv", [self.HEVC, self.AAC], kind="matroska,webm")
         self.assertEqual(command[command.index("-f") + 1], "matroska")
@@ -733,6 +783,38 @@ class Workflow(unittest.TestCase):
         text = share.WORKFLOW % "trunk"
         self.assertIn("branches: [trunk]", text)
         self.assertIn("${{ steps.deployment.outputs.page_url }}", text)
+
+
+class SiteRemove(unittest.TestCase):
+    """--rm on GitHub rewrites the history without the file, in a local repo with a local "origin"."""
+
+    def test_what_is_left_keeps_the_date_it_went_up(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        quiet = dict(check=True, capture_output=True)
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(root / "origin.git")], **quiet)
+        subprocess.run(["git", "clone", "-q", str(root / "origin.git"), str(root / "clone")], **quiet)
+        clone = root / "clone"
+        subprocess.run(["git", "-C", str(clone), "config", "user.email", "t@example.com"], **quiet)
+        subprocess.run(["git", "-C", str(clone), "config", "user.name", "t"], **quiet)
+        (clone / "README.md").write_text("site")
+        for ident, name, when in (("aaaaaaaaaa", "a.png", 1767268800), ("bbbbbbbbbb", "b.png", 1769947200),
+                                  ("cccccccccc", "c.png", 1772366400)):
+            (clone / "f" / ident).mkdir(parents=True)
+            (clone / "f" / ident / name).write_bytes(name.encode())
+            subprocess.run(["git", "-C", str(clone), "add", "-A"], **quiet)
+            env = dict(os.environ, GIT_AUTHOR_DATE="@%d" % when, GIT_COMMITTER_DATE="@%d" % when)
+            subprocess.run(["git", "-C", str(clone), "commit", "-q", "-m", "add " + name], env=env, **quiet)
+        subprocess.run(["git", "-C", str(clone), "push", "-q", "origin", "main"], **quiet)
+        site = share.Site.__new__(share.Site)
+        site.clone, site.branch = clone, "main"
+        with mock.patch.object(share, "say"):
+            site.remove([e for e in site.files() if e.name == "b.png"], wait=False)
+        self.assertEqual([(e.name, e.modified) for e in site.files()], [("a.png", 1767268800), ("c.png", 1772366400)])
+        names = subprocess.run(["git", "-C", str(clone), "log", "--all", "--name-only", "--format="], text=True, **quiet).stdout
+        self.assertNotIn("b.png", names)
+        self.assertTrue((clone / "README.md").exists())
 
 
 class WaitForBuild(unittest.TestCase):
