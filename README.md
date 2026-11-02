@@ -2,7 +2,7 @@
 
 `share PATH` puts a picture or video on the web and prints a link to paste. One Python file, no
 dependencies beyond `python3` (3.9 or newer), plus either a Cloudflare R2 bucket or `git` and the GitHub CLI.
-`exiftool`, `ffmpeg` and `wl-clipboard` add to it when they are installed.
+`exiftool`, `ffmpeg`, `wl-clipboard` and `libnotify` add to it when they are installed.
 
 ```sh
 share easel-teaser.mp4 hero.png     # upload, wait until the links work, print one link per file
@@ -28,7 +28,9 @@ ln -sf ~/Projects/share-cli/share ~/.local/bin/share
 ```
 
 Then set up one of the two places files go. Edit `share` in the repo and the command changes with
-it. On Wayland, `wl-copy` puts the links on the clipboard.
+it. On Wayland, `wl-copy` puts the links on the clipboard. Bound to a desktop hotkey, where there is
+no terminal to read, `share` says how it went in a notification (`notify-send`, from `libnotify`):
+the link, or why it failed.
 
 ### Cloudflare R2 (a link works the moment the upload ends)
 

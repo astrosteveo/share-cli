@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 loader = importlib.machinery.SourceFileLoader("share", str(ROOT / "share"))
 share = importlib.util.module_from_spec(importlib.util.spec_from_loader("share", loader))
 loader.exec_module(share)
+real_notify = share.notify
 
 CONFIG = {
     "endpoint": "https://acct.r2.cloudflarestorage.com",
@@ -29,14 +30,18 @@ CONFIG = {
 
 def setUpModule():
     # Point the config at an empty folder, so no test can read real R2 settings and upload with them.
-    global config_home, environment
+    global config_home, environment, quiet
     config_home = tempfile.TemporaryDirectory()
     environment = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config_home.name})
     environment.start()
     os.environ.pop("SHARE_BACKEND", None)
+    # Tests run without a terminal, where every die() would pop up a real desktop notification.
+    quiet = mock.patch.object(share, "notify")
+    quiet.start()
 
 
 def tearDownModule():
+    quiet.stop()
     environment.stop()
     config_home.cleanup()
 
@@ -709,6 +714,54 @@ class Inputs(unittest.TestCase):
     def test_no_wayland_no_clipboard(self):
         with mock.patch.dict(os.environ, {"WAYLAND_DISPLAY": ""}):
             self.assertEqual(share.from_clipboard(Path("/nowhere")), [])
+
+
+class Notify(unittest.TestCase):
+    """With no terminal, as from a desktop hotkey, how it went goes to a notification."""
+
+    def sent(self, terminal=False, installed=True):
+        with mock.patch.object(share.sys, "stderr", mock.Mock(isatty=lambda: terminal)), \
+                mock.patch.object(share.shutil, "which", return_value="/usr/bin/notify-send" if installed else None), \
+                mock.patch.object(share.subprocess, "run") as run:
+            real_notify("Link copied", "https://share.example.com/f/0123456789/a.png")
+        return [call.args[0] for call in run.call_args_list]
+
+    def test_without_a_terminal_the_title_and_body_go_to_notify_send(self):
+        self.assertEqual(self.sent(), [["notify-send", "--app-name=share", "Link copied",
+                                        "https://share.example.com/f/0123456789/a.png"]])
+
+    def test_in_a_terminal_or_without_notify_send_nothing_is_sent(self):
+        self.assertEqual(self.sent(terminal=True), [])
+        self.assertEqual(self.sent(installed=False), [])
+
+    def test_a_failure_says_why(self):
+        with mock.patch.object(share, "notify") as notify, self.assertRaises(SystemExit):
+            share.die("no such file: a.png")
+        notify.assert_called_once_with("share failed", "no such file: a.png")
+
+    def finished(self, links, copied, waiting=False):
+        with mock.patch.object(share, "notify") as notify, mock.patch("sys.stdout", io.StringIO()), \
+                mock.patch.object(share, "copy_to_clipboard", return_value=copied):
+            share.finish(links, True, waiting)
+        notify.assert_called_once_with(mock.ANY, "\n".join(links))
+        return notify.call_args.args[0]
+
+    def test_the_title_says_how_many_links_and_whether_they_were_copied(self):
+        self.assertEqual(self.finished(["https://a/1"], copied=True), "Link copied")
+        self.assertEqual(self.finished(["https://a/1", "https://a/2"], copied=False), "2 links shared")
+
+    def test_a_link_that_does_not_answer_yet_is_not_called_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp) / "notes.txt"
+            notes.write_text("hello")
+            store = mock.Mock(**{"upload.return_value": True, "url.return_value": "https://a/f/1/notes.txt"})
+            with mock.patch.object(share, "open_store", return_value=store), \
+                    mock.patch.object(share, "check_live", return_value=None), \
+                    mock.patch.object(share, "finish") as finish:
+                share.cmd_share([str(notes)], wait=True, copy=False)
+        finish.assert_called_once_with(["https://a/f/1/notes.txt"], False, True)
+        self.assertEqual(self.finished(["https://a/1"], copied=True, waiting=True),
+                         "Link copied; it may not work for another minute")
 
 
 class Mp4(unittest.TestCase):
