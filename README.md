@@ -12,6 +12,7 @@ share --expire 7d clip.mp4          # R2 deletes it 7 days from now
 share --mp4 phone.mov               # convert video browsers may not play to mp4 first
 share --list                        # what is up, newest first, with dates and links
 share --rm LINK_OR_NAME             # take files down
+share --rm --older-than 90d         # take down what went up more than 90 days ago
 share --setup                       # store Cloudflare R2 settings; from then on files go there
 share --help                        # limits and caveats
 ```

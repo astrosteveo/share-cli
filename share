@@ -6,6 +6,8 @@
     share -                  share what is piped in, such as `grim - | share -`
     share --list             every file that is up, newest first, with its date and link
     share --rm TARGET ...    take files down (a link, a 10-character id or a file name)
+    share --rm --older-than 90d
+                             take down every file that went up more than 90 days ago
     share --setup            store Cloudflare R2 settings; from then on files go there
 
 Files go to one of two places. Both serve them at <base>/f/<id>/<name> with the right content
@@ -1256,11 +1258,19 @@ def cmd_list():
     say("%d file(s), %s in all; %s" % (len(found), human(sum(entry.size for entry in found)), room))
 
 
-def cmd_rm(targets, wait, yes=False):
-    """Takes down what each target names. A target that names more than one file asks first, unless `yes`."""
+def cmd_rm(targets, wait, yes=False, older_than=None):
+    """Takes down what each target names, or with `older_than`, every file that went up more than that many days
+    ago. A target that names more than one file, or any sweep by age, asks first, unless `yes`."""
     store = open_store()
     found = store.files()
     doomed, several = [], False
+    if older_than:
+        cutoff = time.time() - older_than * 86400
+        doomed = [e for e in found if e.modified < cutoff]
+        if not doomed:
+            say("nothing went up more than %s ago" % days_text(older_than))
+            return
+        several, heading = True, "%d file(s) went up more than %s ago:" % (len(doomed), days_text(older_than))
     for target in targets:
         match = re.search(r"/(f|[1-9][0-9]*d)/([0-9a-f]{10})/", target)
         if match:
@@ -1271,8 +1281,9 @@ def cmd_rm(targets, wait, yes=False):
             die("nothing that is up matches %s" % target)
         doomed += [e for e in hits if e not in doomed]
         several = several or len(hits) > 1
+        heading = "that matches %d files:" % len(doomed)
     if several and not yes:
-        say("that matches %d files:" % len(doomed))
+        say(heading)
         for entry in doomed:
             say("  " + store.url(entry.prefix, entry.ident, entry.name))
         if not sys.stdin.isatty():
@@ -1346,7 +1357,9 @@ def main():
     parser.add_argument("paths", nargs="*", metavar="PATH",
                         help="files to put on the web; - reads one from stdin, and none shares what is on the clipboard")
     parser.add_argument("--list", action="store_true", help="list what is up, with links")
-    parser.add_argument("--rm", nargs="+", metavar="TARGET", help="take files down: a link, an id or a file name")
+    parser.add_argument("--rm", nargs="*", metavar="TARGET", help="take files down: a link, an id or a file name")
+    parser.add_argument("--older-than", metavar="DAYS", type=parse_days,
+                        help="with --rm and no targets, take down every file that went up more than DAYS ago, such as 90d")
     parser.add_argument("--setup", action="store_true", help="store Cloudflare R2 settings; from then on files go there")
     parser.add_argument("--expire", metavar="DAYS", type=parse_days,
                         help="R2 deletes the files this many days after upload, such as 7d (R2 only)")
@@ -1357,12 +1370,16 @@ def main():
     parser.add_argument("--no-wait", action="store_true", help="print the links without waiting for the Pages build")
     parser.add_argument("--no-copy", action="store_true", help="leave the clipboard alone")
     args = parser.parse_args()
+    if args.older_than and (args.rm is None or args.rm):
+        parser.error("--older-than goes with --rm and no targets, as in share --rm --older-than 90d")
+    if args.rm == [] and not args.older_than:
+        parser.error("--rm needs a link, an id or a file name, or --older-than")
     if args.setup:
         cmd_setup()
     elif args.list:
         cmd_list()
-    elif args.rm:
-        cmd_rm(args.rm, not args.no_wait, args.yes)
+    elif args.rm is not None:
+        cmd_rm(args.rm, not args.no_wait, args.yes, args.older_than)
     elif not cmd_share(args.paths, not args.no_wait, not args.no_copy, args.expire, args.mp4, args.keep_metadata):
         parser.print_help()
 

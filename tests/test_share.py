@@ -434,15 +434,15 @@ class Remove(unittest.TestCase):
     FILES = [share.Entry("f", "aaaaaaaaaa", "clip.mp4", 1, 0), share.Entry("f", "bbbbbbbbbb", "clip.mp4", 1, 0),
              share.Entry("f", "cccccccccc", "pic.png", 1, 0)]
 
-    def rm(self, targets, yes=False, tty=False, answer=""):
+    def rm(self, targets, yes=False, tty=False, answer="", older_than=None, files=FILES):
         store = mock.Mock()
-        store.files.return_value = self.FILES
+        store.files.return_value = files
         store.url.side_effect = lambda prefix, ident, name: "https://x/%s/%s/%s" % (prefix, ident, name)
         with mock.patch.object(share, "open_store", return_value=store), mock.patch.object(share, "say"), \
                 mock.patch.object(share.sys.stdin, "isatty", return_value=tty), \
                 mock.patch("builtins.input", return_value=answer):
-            share.cmd_rm(targets, wait=False, yes=yes)
-        return store.remove.call_args.args[0]
+            share.cmd_rm(targets, wait=False, yes=yes, older_than=older_than)
+        return store.remove.call_args.args[0] if store.remove.called else None
 
     def test_a_link_an_id_and_a_unique_name_each_take_one_file(self):
         doomed = self.rm(["https://x/f/aaaaaaaaaa/clip.mp4", "bbbbbbbbbb", "pic.png"])
@@ -463,6 +463,29 @@ class Remove(unittest.TestCase):
         self.assertEqual(self.rm(["clip.mp4"], tty=True, answer="y"), self.FILES[:2])
         with self.assertRaises(SystemExit):
             self.rm(["clip.mp4"], tty=True, answer="")
+
+    def dated(self):
+        now = share.time.time()
+        return [share.Entry("f", "aaaaaaaaaa", "old.mp4", 1, now - 91 * 86400),
+                share.Entry("7d", "bbbbbbbbbb", "older.png", 1, now - 400 * 86400),
+                share.Entry("f", "cccccccccc", "new.png", 1, now - 89 * 86400)]
+
+    def test_older_than_takes_only_what_went_up_before_then_and_asks_first(self):
+        files = self.dated()
+        self.assertEqual(self.rm([], older_than=90, tty=True, answer="y", files=files), files[:2])
+        self.assertEqual(self.rm([], older_than=90, yes=True, files=files), files[:2])
+        with self.assertRaises(SystemExit):
+            self.rm([], older_than=90, files=files)  # no terminal to ask in, and no --yes
+
+    def test_older_than_with_nothing_that_old_takes_nothing(self):
+        self.assertIsNone(self.rm([], older_than=400 * 2, yes=True, files=self.dated()))
+
+    def test_older_than_goes_with_rm_and_no_targets(self):
+        for argv in (["--older-than", "90d"], ["--rm", "pic.png", "--older-than", "90d"], ["--rm"]):
+            with mock.patch.object(share.sys, "argv", ["share"] + argv), mock.patch("sys.stderr", io.StringIO()), \
+                    mock.patch.object(share, "cmd_rm") as cmd_rm, self.assertRaises(SystemExit):
+                share.main()
+            cmd_rm.assert_not_called()
 
 
 class Expire(unittest.TestCase):
