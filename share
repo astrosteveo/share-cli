@@ -33,6 +33,7 @@ Things to know:
     keeps its date and camera, which raw converters need. --keep-metadata leaves files as they are.
   * Browsers play mp4 (H.264) and webm inline; .mov, .mkv and .avi may download instead. --mp4
     converts them with ffmpeg first.
+  * --resize 2048 scales JPEG and PNG pictures down with ffmpeg so their longer side is 2048 pixels.
   * --rm on R2 deletes the file at once. With a Cache Purge token in the settings it also clears
     Cloudflare's cache, so the link stops working at once; without one the cache may serve the file
     for up to an hour. A browser that already opened it may keep showing it either way.
@@ -102,6 +103,9 @@ VIDEO_FORMATS = {"mov", "matroska", "avi", "mpegts", "mpeg", "flv", "asf", "ogg"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # PNG chunks that hold words, dates or Exif rather than the picture.
 PNG_DROP = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"tIME"}
+# The ffmpeg filters that turn a picture the way each Exif orientation says it should stand.
+ORIENT = {2: ["hflip"], 3: ["hflip", "vflip"], 4: ["vflip"], 5: ["transpose=0"], 6: ["transpose=1"],
+          7: ["transpose=3"], 8: ["transpose=2"]}
 # The JPEG APPn segments kept, by marker and how the segment starts: JFIF, the colour profile and Adobe's colour
 # transform. Every other APPn (Exif, XMP, IPTC, MPF, C2PA and the rest) and comments go.
 JPEG_KEEP = {(0xE0, b"JFIF\0"), (0xE0, b"JFXX\0"), (0xE2, b"ICC_PROFILE\0"), (0xEE, b"Adobe")}
@@ -810,6 +814,20 @@ def exif_orientation(tiff):
     return 1
 
 
+def jpeg_orientation(data):
+    """The Orientation (1 to 8) in a JPEG's Exif segment, or 1 when it has none."""
+    i = 2
+    while i + 10 <= len(data) and data[i] == 0xFF and data[i + 1] not in (0xD9, 0xDA):
+        if data[i + 1] == 0xFF:  # fill byte
+            i += 1
+            continue
+        end = i + 2 + int.from_bytes(data[i + 2:i + 4], "big")
+        if data[i + 1] == 0xE1 and data[i + 4:i + 10] == b"Exif\0\0":
+            return exif_orientation(data[i + 10:end])
+        i = end
+    return 1
+
+
 def strip_jpeg(data):
     """A JPEG without its metadata: no Exif (so no place, time or camera), XMP, IPTC, comments or the extra pictures
     some phones add after the end. The colour profile stays, and so does the orientation, so the picture stands
@@ -1031,6 +1049,42 @@ def to_mp4(path, folder):
     return target
 
 
+def resize_picture(path, folder, longest):
+    """A copy of a JPEG or PNG in `folder` scaled down so its longer side is `longest` pixels. The file itself when
+    it is no bigger than that, is no JPEG or PNG, or there is no ffmpeg to scale it."""
+    if media_kind(path) != "image":
+        return path
+    if path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+        say("note: %s goes up at its own size; --resize scales JPEG and PNG only" % path.name)
+        return path
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        say("note: %s goes up at its own size; install ffmpeg to scale it" % path.name)
+        return path
+    # image2 picks the decoder by the extension, so ffmpeg never reads the file as a playlist that pulls in others.
+    read = ["-protocol_whitelist", "file", "-f", "image2", "-i", str(path)]
+    done = run(["ffprobe", "-v", "error"] + read + ["-show_entries", "stream=width,height", "-of", "csv=p=0"], check=False)
+    try:
+        width, height = map(int, done.stdout.split()[0].split(","))
+    except (ValueError, IndexError):
+        die("ffprobe cannot read %s as a picture: %s" % (path.name, done.stderr.strip()))
+    if max(width, height) <= longest:
+        return path
+    # The copy has no Exif left to say which way up it stands, so it is turned here. Older ffmpeg does not turn
+    # pictures by their Exif, so it is told not to on any version, and this turns it the same way everywhere.
+    jpeg = path.suffix.lower() != ".png"
+    turn = ORIENT.get(jpeg_orientation(path.read_bytes()) if jpeg else 1, [])
+    scale = "scale=%d:%d:force_original_aspect_ratio=decrease:flags=lanczos" % (longest, longest)
+    target = folder / "resized" / path.name
+    target.parent.mkdir()
+    say("scaling %s down from %dx%d to %d pixels on its longer side" % (path.name, width, height, longest))
+    done = run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-noautorotate"] + read +
+               ["-vf", ",".join(turn + [scale]), "-map_metadata", "-1", "-frames:v", "1", "-update", "1"] +
+               (["-q:v", "2"] if jpeg else []) + [str(target)], check=False)
+    if done.returncode or not target.exists():
+        die("ffmpeg could not scale %s: %s" % (path.name, done.stderr.strip()))
+    return target
+
+
 def sniff_suffix(head):
     """A file extension for bytes with no name, such as a picture piped in, from how they start."""
     for start, suffix in ((PNG_SIGNATURE, ".png"), (b"\xff\xd8\xff", ".jpg"), (b"GIF8", ".gif"), (b"%PDF", ".pdf"),
@@ -1175,11 +1229,11 @@ def finish(links, copy, waiting=False):
     notify(title + ("; it may not work for another minute" if waiting else ""), "\n".join(links))
 
 
-def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata=False):
+def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata=False, resize=None):
     """Puts the files up and prints their links. `-` reads one from stdin, and no paths at all shares what is on the
     clipboard. With `expire`, a number of days, R2 deletes them that long after. `mp4` converts video that browsers
-    may not play, and pictures and videos lose their metadata unless `keep_metadata`. False if there was nothing
-    to share."""
+    may not play, `resize` scales pictures down to that many pixels on their longer side, and pictures and videos
+    lose their metadata unless `keep_metadata`. False if there was nothing to share."""
     config = r2_config()
     if expire and not config:
         die("--expire needs Cloudflare R2 (see share --setup); GitHub Pages cannot delete a file on a timer")
@@ -1199,8 +1253,8 @@ def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata
             size = path.stat().st_size
             if size == 0:
                 die("%s is empty" % path)
-            # --mp4 may bring a video under the limit, so that waits until it is converted.
-            if size > limit and not (mp4 and media_kind(path) == "video"):
+            # --mp4 may bring a video under the limit, and --resize a picture, so that waits until it is done.
+            if size > limit and not (mp4 and media_kind(path) == "video") and not (resize and media_kind(path) == "image"):
                 too_big(size, path.name)
         items = []
         for number, path in enumerate(sources):
@@ -1210,8 +1264,11 @@ def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata
             converted = to_mp4(path, folder) if mp4 else None
             if converted:
                 path, original = converted, Path(original).stem + ".mp4"
-            elif not keep_metadata:
-                path = strip_metadata(path, folder)
+            else:
+                if resize:
+                    path = resize_picture(path, folder, resize)
+                if not keep_metadata:
+                    path = strip_metadata(path, folder)
             size = path.stat().st_size
             if size > limit:
                 too_big(size, original)
@@ -1341,6 +1398,13 @@ def cmd_setup():
     say("saved; `share FILE` now puts files on %s" % config["public_url"])
 
 
+def parse_pixels(text):
+    """--resize's value, a number of pixels such as 2048."""
+    if not re.fullmatch(r"[1-9][0-9]{0,4}", text.strip()):
+        raise argparse.ArgumentTypeError("give a number of pixels, such as 2048")
+    return int(text)
+
+
 def parse_days(text):
     """--expire's value, `7d` or `7`, as a number of days."""
     match = re.fullmatch(r"([1-9][0-9]{0,3})d?", text.strip().lower())
@@ -1364,6 +1428,8 @@ def main():
     parser.add_argument("--expire", metavar="DAYS", type=parse_days,
                         help="R2 deletes the files this many days after upload, such as 7d (R2 only)")
     parser.add_argument("--mp4", action="store_true", help="convert video that browsers may not play inline to mp4")
+    parser.add_argument("--resize", metavar="PIXELS", type=parse_pixels,
+                        help="scale JPEG and PNG pictures down to this many pixels on their longer side, such as 2048")
     parser.add_argument("--keep-metadata", action="store_true",
                         help="leave pictures and videos as they are, with where and when they were taken")
     parser.add_argument("-y", "--yes", action="store_true", help="with --rm, take down every match without asking")
@@ -1374,13 +1440,16 @@ def main():
         parser.error("--older-than goes with --rm and no targets, as in share --rm --older-than 90d")
     if args.rm == [] and not args.older_than:
         parser.error("--rm needs a link, an id or a file name, or --older-than")
+    if args.resize and args.keep_metadata:
+        parser.error("--resize drops a picture's metadata, so it does not go with --keep-metadata")
     if args.setup:
         cmd_setup()
     elif args.list:
         cmd_list()
     elif args.rm is not None:
         cmd_rm(args.rm, not args.no_wait, args.yes, args.older_than)
-    elif not cmd_share(args.paths, not args.no_wait, not args.no_copy, args.expire, args.mp4, args.keep_metadata):
+    elif not cmd_share(args.paths, not args.no_wait, not args.no_copy, args.expire, args.mp4, args.keep_metadata,
+                       args.resize):
         parser.print_help()
 
 

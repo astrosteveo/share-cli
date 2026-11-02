@@ -10,6 +10,7 @@ share                               # share the screenshot, or the files, on the
 grim - | share -                    # share what is piped in
 share --expire 7d clip.mp4          # R2 deletes it 7 days from now
 share --mp4 phone.mov               # convert video browsers may not play to mp4 first
+share --resize 2048 photo.jpg       # scale a big photo down to 2048 pixels on its longer side
 share --list                        # what is up, newest first, with dates and links
 share --rm LINK_OR_NAME             # take files down
 share --rm --older-than 90d         # take down what went up more than 90 days ago
@@ -97,6 +98,13 @@ The rotation stays. Without `ffmpeg`, a video goes up as it is, with a note.
 `--mp4` also runs `ffmpeg`. A video stream that is already H.264 is copied rather than encoded
 again, other video is encoded with `libx264`, and sound that is not AAC becomes AAC. The mp4 has
 its index at the start, so it plays while it loads, and no metadata.
+
+`--resize 2048` runs `ffmpeg` too, on JPEG and PNG pictures whose longer side is over 2048
+pixels; smaller ones and other formats go up as they are. The scaled copy has no Exif left to say
+which way up it stands, so `share` reads the orientation itself and turns the picture to match
+(ffmpeg is told not to, as older versions do not). It reads the picture with ffmpeg's `image2`
+input, which picks the decoder by the extension, so a file named `.jpg` is never read as a
+playlist. `--resize` drops the metadata, so it does not go with `--keep-metadata`.
 
 ffmpeg decides how to read a file from what is in it, not from its name, and some formats it
 reads, such as playlists, pull in other files. So `share` first asks `ffprobe` what the file is,

@@ -787,6 +787,74 @@ class Notify(unittest.TestCase):
                          "Link copied; it may not work for another minute")
 
 
+class Resize(unittest.TestCase):
+    """--resize scales JPEG and PNG pictures down with ffmpeg, turned the way their Exif says."""
+
+    def resize(self, name, data=b"\xff\xd8\xff\xd9", size="4000,3000", ffmpeg=True):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / name
+        path.write_bytes(data)
+        calls = []
+
+        def run(cmd, check=True):
+            calls.append(cmd)
+            if cmd[0] == "ffprobe":
+                return mock.Mock(returncode=0, stdout=size + "\n", stderr="")
+            Path(cmd[-1]).write_bytes(b"small")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(share.shutil, "which", return_value="/usr/bin/ffmpeg" if ffmpeg else None), \
+                mock.patch.object(share, "run", side_effect=run), mock.patch.object(share, "say") as say:
+            out = share.resize_picture(path, Path(tmp.name), 2048)
+        self.said = " ".join(call.args[0] for call in say.call_args_list)
+        return path, out, calls[-1] if calls else None
+
+    def test_a_big_jpeg_is_scaled_to_fit_and_turned_the_way_its_exif_says(self):
+        path, out, ffmpeg = self.resize("photo.jpg", b"\xff\xd8" + exif(6) + b"\xff\xd9")
+        self.assertEqual(out, path.parent / "resized" / "photo.jpg")
+        self.assertEqual(ffmpeg[:6], ["ffmpeg", "-nostdin", "-v", "error", "-y", "-noautorotate"])
+        self.assertIn("transpose=1,scale=2048:2048:force_original_aspect_ratio=decrease:flags=lanczos", ffmpeg)
+        self.assertEqual(ffmpeg[ffmpeg.index("-f") + 1], "image2")  # never read as a playlist
+
+    def test_a_png_is_scaled_without_turning_or_jpeg_quality(self):
+        _, out, ffmpeg = self.resize("shot.png", share.PNG_SIGNATURE)
+        self.assertIn("scale=2048:2048:force_original_aspect_ratio=decrease:flags=lanczos", ffmpeg)
+        self.assertNotIn("-q:v", ffmpeg)
+
+    def test_a_picture_that_fits_is_left_alone(self):
+        path, out, last = self.resize("photo.jpg", size="2048,1536")
+        self.assertEqual(out, path)
+        self.assertEqual(last[0], "ffprobe")
+
+    def test_other_files_and_pictures_without_ffmpeg_go_up_as_they_are(self):
+        for name, ffmpeg in (("notes.txt", True), ("clip.mp4", True), ("anim.gif", True), ("photo.jpg", False)):
+            path, out, last = self.resize(name, ffmpeg=ffmpeg)
+            self.assertEqual((out, last), (path, None))
+        self.assertIn("install ffmpeg", self.said)
+
+    def test_the_orientation_is_read_from_the_exif_segment(self):
+        for order in ("MM", "II"):
+            data = b"\xff\xd8" + segment(0xE0, b"JFIF\0\1\1") + exif(8, order) + StripJpeg.SCAN
+            self.assertEqual(share.jpeg_orientation(data), 8)
+        self.assertEqual(share.jpeg_orientation(b"\xff\xd8" + StripJpeg.SCAN + exif(6)), 1)  # Exif after the picture
+
+    def test_resize_does_not_go_with_keep_metadata(self):
+        with mock.patch.object(share.sys, "argv", ["share", "--resize", "2048", "--keep-metadata", "a.jpg"]), \
+                mock.patch("sys.stderr", io.StringIO()), mock.patch.object(share, "cmd_share") as cmd_share, \
+                self.assertRaises(SystemExit):
+            share.main()
+        cmd_share.assert_not_called()
+
+    def test_a_big_picture_gets_to_shrink_before_the_size_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp) / "big.png"
+            with open(big, "wb") as handle:
+                handle.truncate(share.MAX_BYTES + 1)
+            with mock.patch.object(share, "resize_picture", side_effect=SystemExit("scaling")):
+                with self.assertRaisesRegex(SystemExit, "scaling"):
+                    share.cmd_share([str(big)], wait=False, copy=False, resize=2048)
+
+
 class Mp4(unittest.TestCase):
     """--mp4 asks ffprobe what a video holds and converts only what browsers may not play."""
 
