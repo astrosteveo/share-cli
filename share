@@ -4,6 +4,7 @@
     share PATH [PATH ...]    upload, wait until the link works, print one link per file
     share                    share what is on the clipboard: a screenshot, or files copied
     share -                  share what is piped in, such as `grim - | share -`
+    share --album PATH ...   put up the files and one page that shows them all, and print its link
     share --list             every file that is up, newest first, with its date and link
     share --rm TARGET ...    take files down (a link, a 10-character id or a file name)
     share --rm --older-than 90d
@@ -52,6 +53,7 @@ import codecs
 import getpass
 import hashlib
 import hmac
+import html
 import http.client
 import json
 import mimetypes
@@ -145,6 +147,24 @@ jobs:
         with:
           reporting_interval: 1000
 """
+ALBUM = """\
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="script-src 'none'">
+<title>%d files</title>
+<style>
+body { margin: 0; background: #111; color: #eee; font: 16px system-ui, sans-serif; }
+main { max-width: 1100px; margin: auto; padding: 16px; display: grid; gap: 16px; }
+img, video { width: 100%%; height: auto; border-radius: 6px; background: #000; }
+a { color: #9cf; }
+</style>
+<main>
+%s
+</main>
+</html>
+"""
 DEPLOY_FAILED = {"deployment_failed", "deployment_content_failed", "deployment_attempt_error", "deployment_lost"}
 
 
@@ -201,8 +221,10 @@ def clean_name(name):
     return stem + suffix
 
 
-# A file that is up: `prefix` is the folder it is in, `f` (kept until --rm) or `<n>d` (deleted by R2 n days after it
-# went up), and `modified` is when it went up.
+# The folders files go in: `f` (kept until --rm) or `<n>d` (deleted by R2 n days after they went up). An album's
+# page goes in `a/` inside its files' folder, so it expires with them.
+PREFIX = r"(?:f|[1-9][0-9]*d)(?:/a)?"
+# A file that is up: `prefix` is the folder it is in, and `modified` is when it went up.
 Entry = namedtuple("Entry", "prefix ident name size modified")
 # A file to put up: `path` holds its bytes, `name` is its name in the link and `original` the name it had.
 Item = namedtuple("Item", "path prefix ident name digest size original")
@@ -214,15 +236,18 @@ def link(base, prefix, ident, name):
 
 def parse_key(key):
     """(prefix, id, name) for a key in the layout `<prefix>/<id>/<name>`, else None."""
-    parts = key.split("/")
-    if len(parts) == 3 and re.fullmatch(r"f|[1-9][0-9]*d", parts[0]) and re.fullmatch(r"[0-9a-f]{10}", parts[1]) and parts[2]:
-        return tuple(parts)
-    return None
+    match = re.fullmatch(r"(%s)/([0-9a-f]{10})/([^/]+)" % PREFIX, key)
+    return match.groups() if match else None
+
+
+def is_album(prefix):
+    return prefix.endswith("/a")
 
 
 def expiry_days(prefix):
     """How many days after upload R2 deletes a file in this folder, or None for `f`, which keeps its files."""
-    return int(prefix[:-1]) if prefix.endswith("d") else None
+    folder = prefix.split("/")[0]
+    return int(folder[:-1]) if folder.endswith("d") else None
 
 
 def days_text(days):
@@ -522,11 +547,15 @@ class Site:
             elif line.strip():
                 stamp = int(line)
         found = []
-        for path in sorted((self.clone / "f").glob("*/*")):
+        for path in sorted((self.clone / "f").glob("*/*")) + sorted((self.clone / "f" / "a").glob("*/*")):
             key = path.relative_to(self.clone).as_posix()
-            if path.is_file() and parse_key(key):
-                found.append(Entry("f", path.parent.name, path.name, path.stat().st_size, added.get(key, 0)))
+            parts = parse_key(key)
+            if path.is_file() and parts:
+                found.append(Entry(*parts, path.stat().st_size, added.get(key, 0)))
         return found
+
+    def read(self, entry):
+        return (self.clone / entry.prefix / entry.ident / entry.name).read_bytes()
 
     def upload(self, items, wait):
         """Commits and pushes the files that are not up yet. False if `wait` and the deploy is still running after three minutes."""
@@ -654,6 +683,9 @@ class Bucket:
                 return found
             query = dict(query, **{"continuation-token": token})
 
+    def read(self, entry):
+        return self.request("GET", "%s/%s/%s" % (entry.prefix, entry.ident, entry.name))[1]
+
     def upload(self, items, wait):
         """Puts each file that is not up yet, a few at a time. Always True: there is no build to wait for."""
         items = list({self.key(item): item for item in items}.values())  # the same file named twice goes up once
@@ -688,7 +720,8 @@ class Bucket:
         headers = {
             "cache-control": R2_CACHE_CONTROL,
             "content-disposition": disposition(item.name, item.original),
-            "content-type": content_type(item.path, item.name),
+            # Only album pages, which share writes itself, are served as pages; every other HTML file is plain text.
+            "content-type": "text/html; charset=utf-8" if is_album(item.prefix) else content_type(item.path, item.name),
         }
         if item.size > MULTIPART_BYTES:
             return self.put_parts(item, headers, progress)
@@ -1085,6 +1118,28 @@ def resize_picture(path, folder, longest):
     return target
 
 
+def album_page(items):
+    """An album's page: each file in turn, pictures and videos shown, anything else as a link. It reaches them by
+    relative links from `<prefix>/a/<id>/index.html`, so it works on R2 and GitHub alike, and holds no script."""
+    shown = []
+    for item in items:
+        src, name = "../../%s/%s" % (item.ident, urllib.parse.quote(item.name)), html.escape(item.original)
+        kind = media_kind(item.path)
+        if kind == "image":
+            shown.append('<img src="%s" alt="%s" loading="lazy">' % (src, name))
+        elif kind == "video":
+            shown.append('<video src="%s" controls preload="metadata"><a href="%s">%s</a></video>' % (src, src, name))
+        else:
+            shown.append('<a href="%s">%s</a>' % (src, name))
+    return ALBUM % (len(items), "\n".join(shown))
+
+
+def album_files(page):
+    """The (id, name) of each file an album's page shows."""
+    return [(ident, urllib.parse.unquote(name)) for ident, name in
+            re.findall(r'(?:src|href)="\.\./\.\./([0-9a-f]{10})/([^"/]+)"', page.decode("utf-8", "replace"))]
+
+
 def sniff_suffix(head):
     """A file extension for bytes with no name, such as a picture piped in, from how they start."""
     for start, suffix in ((PNG_SIGNATURE, ".png"), (b"\xff\xd8\xff", ".jpg"), (b"GIF8", ".gif"), (b"%PDF", ".pdf"),
@@ -1229,11 +1284,12 @@ def finish(links, copy, waiting=False):
     notify(title + ("; it may not work for another minute" if waiting else ""), "\n".join(links))
 
 
-def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata=False, resize=None):
+def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata=False, resize=None, album=False):
     """Puts the files up and prints their links. `-` reads one from stdin, and no paths at all shares what is on the
     clipboard. With `expire`, a number of days, R2 deletes them that long after. `mp4` converts video that browsers
     may not play, `resize` scales pictures down to that many pixels on their longer side, and pictures and videos
-    lose their metadata unless `keep_metadata`. False if there was nothing to share."""
+    lose their metadata unless `keep_metadata`. With `album`, one page shows them all, and its link is the one
+    printed. False if there was nothing to share."""
     config = r2_config()
     if expire and not config:
         die("--expire needs Cloudflare R2 (see share --setup); GitHub Pages cannot delete a file on a timer")
@@ -1279,6 +1335,12 @@ def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata
             digest = file_sha256(path)
             items.append(Item(path, prefix, digest[:10], clean_name(original), digest, size, original))
 
+        if album:
+            page = work / "album" / "index.html"
+            page.parent.mkdir()
+            page.write_text(album_page(items))
+            digest = file_sha256(page)
+            items.append(Item(page, prefix + "/a", digest[:10], page.name, digest, page.stat().st_size, page.name))
         if expire:
             expiry_rule(config, expire)
         store = open_store()
@@ -1294,7 +1356,7 @@ def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata
                 waiting = True
             else:
                 say("ok  %s  (%s)" % (each.rsplit("/", 1)[-1], kind.split(";")[0]))
-    finish(links, copy, waiting)
+    finish(links[-1:] if album else links, copy, waiting)
     return True
 
 
@@ -1307,7 +1369,8 @@ def cmd_list():
         return
     for entry in found:
         days = expiry_days(entry.prefix)
-        until = "  (deleted about %s)" % day(entry.modified + days * 86400) if days else ""
+        until = "  (album)" if is_album(entry.prefix) else ""
+        until += "  (deleted about %s)" % day(entry.modified + days * 86400) if days else ""
         print("%s  %8s  %s%s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.modified)), human(entry.size),
                                  store.url(entry.prefix, entry.ident, entry.name), until))
     sys.stdout.flush()
@@ -1329,7 +1392,7 @@ def cmd_rm(targets, wait, yes=False, older_than=None):
             return
         several, heading = True, "%d file(s) went up more than %s ago:" % (len(doomed), days_text(older_than))
     for target in targets:
-        match = re.search(r"/(f|[1-9][0-9]*d)/([0-9a-f]{10})/", target)
+        match = re.search(r"/(%s)/([0-9a-f]{10})/" % PREFIX, target)
         if match:
             hits = [e for e in found if (e.prefix, e.ident) == match.groups()]
         else:
@@ -1347,7 +1410,27 @@ def cmd_rm(targets, wait, yes=False, older_than=None):
             die("add --yes to take them all down")
         if input("take all %d down? [y/N] " % len(doomed)).strip().lower() not in ("y", "yes"):
             die("nothing was taken down")
+    doomed += album_contents(store, found, doomed, yes)
     store.remove(doomed, wait)
+
+
+def album_contents(store, found, doomed, yes):
+    """The files the albums among `doomed` show that are up and not going already, if the user wants them gone
+    too. They may be shared on their own as well, so this asks; `yes` takes them without asking."""
+    held = []
+    for page in [e for e in doomed if is_album(e.prefix)]:
+        shows = set(album_files(store.read(page)))
+        held += [e for e in found if e.prefix == page.prefix.split("/")[0] and (e.ident, e.name) in shows
+                 and e not in doomed and e not in held]
+    if not held or yes:
+        return held
+    say("the album shows %d file(s) that are up:" % len(held))
+    for entry in held:
+        say("  " + store.url(entry.prefix, entry.ident, entry.name))
+    if sys.stdin.isatty() and input("take them down too? [y/N] ").strip().lower() in ("y", "yes"):
+        return held
+    say("they stay up%s" % ("" if sys.stdin.isatty() else "; add --yes to take them down too"))
+    return []
 
 
 def ask(prompt, default=""):
@@ -1430,9 +1513,11 @@ def main():
     parser.add_argument("--mp4", action="store_true", help="convert video that browsers may not play inline to mp4")
     parser.add_argument("--resize", metavar="PIXELS", type=parse_pixels,
                         help="scale JPEG and PNG pictures down to this many pixels on their longer side, such as 2048")
+    parser.add_argument("--album", action="store_true", help="put up one page that shows all the files, and print its link")
     parser.add_argument("--keep-metadata", action="store_true",
                         help="leave pictures and videos as they are, with where and when they were taken")
-    parser.add_argument("-y", "--yes", action="store_true", help="with --rm, take down every match without asking")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="with --rm, take down every match, and the files of an album, without asking")
     parser.add_argument("--no-wait", action="store_true", help="print the links without waiting for the Pages build")
     parser.add_argument("--no-copy", action="store_true", help="leave the clipboard alone")
     args = parser.parse_args()
@@ -1449,7 +1534,7 @@ def main():
     elif args.rm is not None:
         cmd_rm(args.rm, not args.no_wait, args.yes, args.older_than)
     elif not cmd_share(args.paths, not args.no_wait, not args.no_copy, args.expire, args.mp4, args.keep_metadata,
-                       args.resize):
+                       args.resize, args.album):
         parser.print_help()
 
 

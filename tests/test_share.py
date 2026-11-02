@@ -491,6 +491,89 @@ class Remove(unittest.TestCase):
             cmd_rm.assert_not_called()
 
 
+class Album(unittest.TestCase):
+    """--album puts up one page that shows the files, in `a/` inside their folder, and --rm offers to take its files."""
+
+    def test_album_pages_are_in_the_layout_inside_their_files_folder(self):
+        self.assertEqual(share.parse_key("f/a/0123456789/index.html"), ("f/a", "0123456789", "index.html"))
+        self.assertEqual(share.parse_key("7d/a/0123456789/index.html"), ("7d/a", "0123456789", "index.html"))
+        for stray in ("a/0123456789/index.html", "f/a/a/0123456789/index.html", "f/b/0123456789/x", "f/0123456789/"):
+            self.assertIsNone(share.parse_key(stray))
+        self.assertEqual((share.expiry_days("7d/a"), share.expiry_days("f/a")), (7, None))
+
+    def test_the_page_shows_pictures_and_videos_links_the_rest_and_escapes_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            items = []
+            for name, original in (("a.png", "a.png"), ("My-Clip.mp4", "My Clip <1>.mp4"), ("notes.txt", "notes.txt")):
+                path = Path(tmp) / name
+                path.write_bytes(b"x")
+                items.append(share.Item(path, "f", "%010d" % len(items), name, "d", 1, original))
+            page = share.album_page(items)
+        self.assertIn('<img src="../../0000000000/a.png" alt="a.png" loading="lazy">', page)
+        self.assertIn('<video src="../../0000000001/My-Clip.mp4" controls', page)
+        self.assertIn("My Clip &lt;1&gt;.mp4", page)
+        self.assertIn('<a href="../../0000000002/notes.txt">notes.txt</a>', page)
+        self.assertNotIn("<script", page)
+        self.assertEqual(share.album_files(page.encode()), [("0000000000", "a.png"), ("0000000001", "My-Clip.mp4"),
+                                                            ("0000000001", "My-Clip.mp4"), ("0000000002", "notes.txt")])
+
+    def test_only_an_album_page_is_served_as_a_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "index.html"
+            page.write_text("<!doctype html>")
+            bucket = share.Bucket(CONFIG)
+            bucket.request = mock.Mock(return_value=(200, b"", {}))
+            for prefix, served in (("f/a", "text/html; charset=utf-8"), ("f", "text/plain; charset=utf-8")):
+                bucket.put(share.Item(page, prefix, "0123456789", "index.html", "d", page.stat().st_size, "index.html"),
+                           share.Progress(1))
+                self.assertEqual(bucket.request.call_args.kwargs["headers"]["content-type"], served)
+
+    def test_share_puts_up_the_files_and_the_page_and_prints_only_the_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = [Path(tmp) / "a.txt", Path(tmp) / "b.txt"]
+            for path in paths:
+                path.write_text(path.name)
+            store = mock.Mock(**{"upload.return_value": True})
+            store.url.side_effect = lambda prefix, ident, name: "https://x/%s/%s/%s" % (prefix, ident, name)
+            with mock.patch.object(share, "open_store", return_value=store), mock.patch.object(share, "say"), \
+                    mock.patch.object(share, "finish") as finish:
+                share.cmd_share([str(p) for p in paths], wait=False, copy=False, album=True)
+            items = store.upload.call_args.args[0]
+        self.assertEqual([(i.prefix, i.name) for i in items], [("f", "a.txt"), ("f", "b.txt"), ("f/a", "index.html")])
+        self.assertEqual(finish.call_args.args[0], ["https://x/f/a/%s/index.html" % items[2].ident])
+
+    PAGE = share.Entry("f/a", "9999999999", "index.html", 1, 0)
+    FILES = [PAGE, share.Entry("f", "aaaaaaaaaa", "a.png", 1, 0), share.Entry("f", "bbbbbbbbbb", "b.mp4", 1, 0),
+             share.Entry("f", "cccccccccc", "other.png", 1, 0)]
+
+    def rm(self, yes=False, tty=False, answer=""):
+        store = mock.Mock()
+        store.files.return_value = self.FILES
+        store.read.return_value = b'<img src="../../aaaaaaaaaa/a.png"><video src="../../bbbbbbbbbb/b.mp4"></video>'
+        store.url.side_effect = lambda prefix, ident, name: "https://x/%s/%s/%s" % (prefix, ident, name)
+        with mock.patch.object(share, "open_store", return_value=store), mock.patch.object(share, "say"), \
+                mock.patch.object(share.sys.stdin, "isatty", return_value=tty), \
+                mock.patch("builtins.input", return_value=answer):
+            share.cmd_rm(["https://x/f/a/9999999999/index.html"], wait=False, yes=yes)
+        return store.remove.call_args.args[0]
+
+    def test_rm_of_an_album_asks_whether_its_files_go_too(self):
+        self.assertEqual(self.rm(tty=True, answer="y"), self.FILES[:3])
+        self.assertEqual(self.rm(tty=True, answer=""), [self.PAGE])
+        self.assertEqual(self.rm(), [self.PAGE])  # no terminal to ask in: the files stay
+        self.assertEqual(self.rm(yes=True), self.FILES[:3])
+
+    def test_list_marks_albums(self):
+        store = mock.Mock(spec=share.Bucket)
+        store.files.return_value = self.FILES[:2]
+        store.url.side_effect = lambda prefix, ident, name: "https://x/%s/%s/%s" % (prefix, ident, name)
+        with mock.patch.object(share, "open_store", return_value=store), mock.patch.object(share, "say"), \
+                mock.patch("sys.stdout", io.StringIO()) as out:
+            share.cmd_list()
+        self.assertIn("https://x/f/a/9999999999/index.html  (album)", out.getvalue())
+        self.assertNotIn("a.png  (album)", out.getvalue())
+
+
 class Expire(unittest.TestCase):
     """--expire puts files in `<n>d/`, which a lifecycle rule on the bucket empties; the rule is added once, with cf."""
 

@@ -11,6 +11,7 @@ grim - | share -                    # share what is piped in
 share --expire 7d clip.mp4          # R2 deletes it 7 days from now
 share --mp4 phone.mov               # convert video browsers may not play to mp4 first
 share --resize 2048 photo.jpg       # scale a big photo down to 2048 pixels on its longer side
+share --album a.jpg b.jpg clip.mp4  # one link to a page that shows them all
 share --list                        # what is up, newest first, with dates and links
 share --rm LINK_OR_NAME             # take files down
 share --rm --older-than 90d         # take down what went up more than 90 days ago
@@ -122,6 +123,14 @@ reads, such as playlists, pull in other files. So `share` first asks `ffprobe` w
 and has `ffmpeg` read it only as a video container (`mov`, `matroska`, `avi`, `mpegts` and a few
 more), from local files only. A playlist named `funny.mov` that lists another of your videos is
 refused, not uploaded with that video inside.
+
+**Albums.** `--album` puts the files up as usual, then one page that shows them all: pictures and
+videos in place, anything else as a link. The page goes in `a/` inside its files' folder, as
+`f/a/<id>/index.html` (or `7d/a/...` with `--expire 7d`, so it is deleted with its files), and its
+link is the one printed. It reaches the files by relative links, so it works on R2 and GitHub alike,
+and holds no script. Album pages are the only files R2 serves as web pages; any other HTML still goes
+up as plain text. `--rm` of an album lists the files it shows and asks whether they go too, since
+they may be shared on their own; `--yes` takes them without asking.
 
 **Input.** `share` with no path reads the Wayland clipboard with `wl-paste`. Files copied in a
 file manager (`text/uri-list`) are shared by path. Otherwise a picture on the clipboard is saved
