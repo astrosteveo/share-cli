@@ -1,7 +1,7 @@
 # share-cli
 
 `share PATH` puts a picture or video on the web and prints a link to paste. One Python file, no
-dependencies beyond `python3`, plus either a Cloudflare R2 bucket or `git` and the GitHub CLI.
+dependencies beyond `python3` (3.9 or newer), plus either a Cloudflare R2 bucket or `git` and the GitHub CLI.
 `exiftool`, `ffmpeg` and `wl-clipboard` add to it when they are installed.
 
 ```sh
@@ -178,7 +178,8 @@ multipart uploads and resuming them, retries, expiry rules, metadata stripping (
 built byte by byte, and the exiftool and ffmpeg commands for other pictures, RAW photos and
 videos), refusing playlists named like videos, `--mp4`'s choices, the clipboard and stdin, `--rm`'s question and the wait for
 Pages. None of them touch the network or need `exiftool` or `ffmpeg`, and none read your real R2
-settings.
+settings. GitHub Actions runs them on every push to `main` and every PR, on Python 3.9 (the oldest
+they pass on) and 3.14.
 
 ## Licence
 
