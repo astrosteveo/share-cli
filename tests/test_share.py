@@ -202,22 +202,22 @@ class Setup(unittest.TestCase):
         return json.loads(share.config_path().read_text())
 
     def test_saves_the_settings_for_your_eyes_only(self):
-        saved = self.setup(["https://acct.r2.cloudflarestorage.com/share", "", "key", "share.example.com", ""], "secret")
+        saved = self.setup(["https://acct.r2.cloudflarestorage.com/share", "", "key", "share.example.com", "", ""], "secret")
         self.assertEqual(saved, CONFIG)
         self.assertEqual(share.config_path().stat().st_mode & 0o777, 0o600)
 
     def test_enter_keeps_the_saved_secret(self):
         write_config(CONFIG)
-        saved = self.setup(["", "", "", "", ""], "")
+        saved = self.setup(["", "", "", "", "", ""], "")
         self.assertEqual(saved, CONFIG)
 
     def test_enter_keeps_the_saved_purge_settings(self):
         write_config(dict(CONFIG, zone_id="zone", purge_token="tok"))
-        saved = self.setup(["", "", "", "", ""], "")
+        saved = self.setup(["", "", "", "", "", ""], "")
         self.assertEqual(saved, dict(CONFIG, zone_id="zone", purge_token="tok"))
 
     def test_bad_settings_are_not_saved(self):
-        with mock.patch("builtins.input", side_effect=["acct.r2.cloudflarestorage.com", "share", "key", "x.example.com", ""]), \
+        with mock.patch("builtins.input", side_effect=["acct.r2.cloudflarestorage.com", "share", "key", "x.example.com", "", ""]), \
                 mock.patch.object(share.getpass, "getpass", return_value="wrong"), \
                 mock.patch.object(share.Bucket, "files", side_effect=SystemExit(1)), \
                 mock.patch.object(share, "say"):
@@ -343,7 +343,7 @@ class Parts(unittest.TestCase):
     def put(self, unfinished=""):
         sent = {}
 
-        def answer(method, key="", query=None, body=None, digest=None, headers=None, tries=3):
+        def answer(method, key="", query=None, body=None, digest=None, headers=None, tries=3, bucket=None):
             query = query or {}
             if method == "GET" and "uploads" in query:
                 return 200, ("<ListMultipartUploadsResult>%s</ListMultipartUploadsResult>" % unfinished).encode(), {}
@@ -611,8 +611,8 @@ class Expire(unittest.TestCase):
         config = dict(CONFIG)
         with mock.patch.object(share.shutil, "which", return_value="/usr/bin/cf"), \
                 mock.patch.object(share.subprocess, "run", side_effect=cf), mock.patch.object(share, "say"):
-            share.expiry_rule(config, 7)
-            share.expiry_rule(config, 7)  # known now, so no second call
+            share.expiry_rule(config, "7d")
+            share.expiry_rule(config, "7d")  # known now, so no second call
         return calls
 
     def test_the_rule_is_added_beside_the_rules_already_there_once(self):
@@ -625,6 +625,130 @@ class Expire(unittest.TestCase):
         self.assertEqual(rules, [other, {"id": "share-expire-7d", "enabled": True, "conditions": {"prefix": "7d/"},
                                          "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": 604800}}}])
         self.assertEqual(share.r2_config()["expire_days"], [7])
+
+
+class Private(unittest.TestCase):
+    """--private puts files in a second bucket with no domain, in `p<n>d/`, and prints presigned links."""
+
+    PRIVATE = dict(CONFIG, private_bucket="share-private", zone_id="zone", purge_token="tok")
+
+    def tearDown(self):
+        share.config_path().unlink(missing_ok=True)
+
+    def test_a_presigned_link_matches_botocore(self):
+        # From botocore 1.x generate_presigned_url("get_object") with the same keys, path-style, at 2026-11-02 05:00:00.
+        link = share.presign("acct.r2.cloudflarestorage.com", "/shared-private/p1d/0123456789/My-Clip.mp4", "AKIDEXAMPLE",
+                             "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", 3600, "20261102T050000Z")
+        self.assertTrue(link.startswith("https://acct.r2.cloudflarestorage.com/shared-private/p1d/0123456789/My-Clip.mp4?"))
+        self.assertIn("X-Amz-Expires=3600", link)
+        self.assertIn("X-Amz-Signature=25b905a4680cafe5e5bce4b7da655f64db06cf8a3767edd522210d7cae7db831", link)
+
+    def test_times_are_read_up_to_seven_days(self):
+        for text, seconds in (("30m", 1800), ("1h", 3600), ("2D", 172800), ("7d", 604800), ("168h", 604800)):
+            self.assertEqual(share.parse_duration(text), seconds)
+        for bad in ("8d", "169h", "0h", "10s", "1", "h"):
+            with self.assertRaises(share.argparse.ArgumentTypeError):
+                share.parse_duration(bad)
+
+    def test_private_keys_are_in_the_layout_and_live_in_the_private_bucket(self):
+        self.assertEqual(share.parse_key("p1d/0123456789/a.png"), ("p1d", "0123456789", "a.png"))
+        self.assertIsNone(share.parse_key("pf/0123456789/a.png"))
+        self.assertEqual(share.expiry_days("p3d"), 3)
+        bucket = share.Bucket(self.PRIVATE)
+        self.assertEqual((bucket.bucket_for("p1d/0123456789/a.png"), bucket.bucket_for("f/0123456789/a.png")),
+                         ("share-private", "share"))
+        self.assertEqual(bucket.url("p1d", "0123456789", "a b.png"), "private:p1d/0123456789/a%20b.png")
+
+    def test_files_lists_both_buckets_and_only_what_belongs_in_each(self):
+        listed = {"share": [("f/aaaaaaaaaa/a.png", 1), ("p1d/bbbbbbbbbb/stray.png", 1)],
+                  "share-private": [("p1d/cccccccccc/c.png", 1), ("f/dddddddddd/stray.png", 1)]}
+        bucket = share.Bucket(self.PRIVATE)
+        bucket.request = mock.Mock(side_effect=lambda method, query=None, bucket=None, **_: Bucket.page(None, listed[bucket]))
+        self.assertEqual([(e.prefix, e.name) for e in bucket.files()], [("f", "a.png"), ("p1d", "c.png")])
+
+    def test_a_private_upload_is_not_cached_or_purged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            path.write_bytes(b"picture")
+            bucket = share.Bucket(self.PRIVATE)
+            bucket.request = mock.Mock(side_effect=lambda method, key="", **_: (404 if method == "HEAD" else 200, b"", {}))
+            bucket.purge = mock.Mock()
+            with mock.patch.object(share, "say"):
+                bucket.upload([share.Item(path, "p1d", "0123456789", "a.png", "d", 7, "a.png")], wait=True)
+                bucket.remove([share.Entry("p1d", "0123456789", "a.png", 7, 0)], wait=False)
+        [put] = [call for call in bucket.request.call_args_list if call.args[0] == "PUT"]
+        self.assertEqual(put.args[1], "p1d/0123456789/a.png")
+        self.assertEqual(put.kwargs["headers"]["cache-control"], "private")
+        bucket.purge.assert_not_called()
+
+    def shared(self, seconds, config):
+        write_config(config)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "notes.txt"
+            path.write_text("hello")
+            store = mock.Mock(**{"upload.return_value": True})
+            store.presign.side_effect = lambda prefix, ident, name, seconds: "https://s3/%s/%s/%s?sig&%d" % (prefix, ident, name, seconds)
+            with mock.patch.object(share, "open_store", return_value=store), mock.patch.object(share, "say"), \
+                    mock.patch.object(share, "expiry_rule") as rule, \
+                    mock.patch.object(share, "check_live", return_value="text/plain") as live, \
+                    mock.patch.object(share, "finish") as finish:
+                share.cmd_share([str(path)], wait=True, copy=False, private=seconds)
+        return store.upload.call_args.args[0][0], rule.call_args.args[1], live.call_args.args, finish.call_args.args[0]
+
+    def test_share_puts_files_in_the_folder_for_their_day_and_prints_presigned_links(self):
+        item, folder, checked, links = self.shared(3600, self.PRIVATE)
+        self.assertEqual((item.prefix, folder), ("p1d", "p1d"))
+        self.assertEqual(links, ["https://s3/p1d/%s/notes.txt?sig&3600" % item.ident])
+        self.assertEqual(checked, (links[0], "GET"))  # signed for GET only
+        self.assertEqual(self.shared(25 * 3600, self.PRIVATE)[1], "p2d")
+
+    def test_share_needs_a_private_bucket(self):
+        with self.assertRaises(SystemExit):
+            self.shared(3600, CONFIG)
+
+    def test_private_does_not_go_with_expire_or_album(self):
+        for other in (["--expire", "7d"], ["--album"]):
+            with mock.patch.object(share.sys, "argv", ["share", "--private", "1h"] + other + ["a.png"]), \
+                    mock.patch("sys.stderr", io.StringIO()), mock.patch.object(share, "cmd_share") as cmd_share, \
+                    self.assertRaises(SystemExit):
+                share.main()
+            cmd_share.assert_not_called()
+
+    def test_the_rule_for_a_private_folder_goes_on_the_private_bucket(self):
+        write_config(self.PRIVATE)
+        calls = []
+
+        def cf(cmd, **kwargs):
+            calls.append(cmd)
+            return mock.Mock(returncode=0, stdout=json.dumps({"rules": []}) if "get" in cmd else "", stderr="")
+        with mock.patch.object(share.shutil, "which", return_value="/usr/bin/cf"), \
+                mock.patch.object(share.subprocess, "run", side_effect=cf), mock.patch.object(share, "say"):
+            share.expiry_rule(dict(self.PRIVATE), "p1d")
+        self.assertEqual(calls[0][4:6], ["get", "share-private"])
+        rules = json.loads(calls[1][calls[1].index("--rules") + 1])
+        self.assertEqual(rules[0]["id"], "share-expire-p1d")
+        self.assertEqual(rules[0]["conditions"], {"prefix": "p1d/"})
+        saved = share.r2_config()
+        self.assertEqual((saved["private_expire_days"], saved.get("expire_days")), ([1], None))
+
+    def test_rm_takes_a_private_file_by_its_listed_name_or_its_link(self):
+        entry = share.Entry("p1d", "0123456789", "a.png", 1, 0)
+        store = mock.Mock(**{"files.return_value": [share.Entry("f", "0123456789", "a.png", 1, 0), entry]})
+        for target in ("private:p1d/0123456789/a.png", "https://acct.r2.cloudflarestorage.com/share-private/p1d/0123456789/a.png?X-Amz-Signature=1"):
+            with mock.patch.object(share, "open_store", return_value=store), mock.patch.object(share, "say"):
+                share.cmd_rm([target], wait=False)
+            self.assertEqual(store.remove.call_args.args[0], [entry])
+
+    def test_setup_saves_the_private_bucket_and_keeps_its_rules(self):
+        write_config(dict(CONFIG, private_bucket="share-private", private_expire_days=[1], expire_days=[7]))
+        with mock.patch("builtins.input", side_effect=["", "", "", "", "", ""]), \
+                mock.patch.object(share.getpass, "getpass", return_value=""), \
+                mock.patch.object(share.Bucket, "files", return_value=[]), \
+                mock.patch.object(share.urllib.request, "urlopen"), mock.patch.object(share, "say"):
+            share.cmd_setup()
+        saved = json.loads(share.config_path().read_text())
+        self.assertEqual((saved["private_bucket"], saved["private_expire_days"], saved["expire_days"]),
+                         ("share-private", [1], [7]))
 
 
 def segment(marker, payload):

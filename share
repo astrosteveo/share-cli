@@ -5,6 +5,7 @@
     share                    share what is on the clipboard: a screenshot, or files copied
     share -                  share what is piped in, such as `grim - | share -`
     share --album PATH ...   put up the files and one page that shows them all, and print its link
+    share --private 1h PATH  a link that stops working in an hour, from a bucket nobody can browse
     share --list             every file that is up, newest first, with its date and link
     share --rm TARGET ...    take files down (a link, a 10-character id or a file name)
     share --rm --older-than 90d
@@ -28,7 +29,8 @@ link.
 
 Things to know:
   * Anyone with a link can open the file, and anyone can browse the GitHub repo. Never share what
-    you would not post openly.
+    you would not post openly. --private links stop working after a set time, at most 7 days; they
+    need a second R2 bucket with no custom domain (see share --setup).
   * Pictures and videos go up without where, when and on what they were taken: pictures with
     exiftool for every format it knows, else JPEG and PNG only, and videos with ffmpeg. A RAW photo
     keeps its date and camera, which raw converters need. --keep-metadata leaves files as they are.
@@ -85,6 +87,7 @@ MAX_PARTS = 10000
 PROGRESS_BYTES = 8 * 1024 * 1024  # smaller uploads end before a progress line would help
 WORKERS = 4  # files put up, or links checked, at once
 R2_KEYS = ("endpoint", "bucket", "access_key_id", "secret_access_key", "public_url")
+PRIVATE_MAX_SECONDS = 7 * 86400  # the longest a presigned link may last
 # A link always names the same bytes, so caching is safe; the hour bounds how long a removed file lingers.
 R2_CACHE_CONTROL = "public, max-age=3600"
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
@@ -221,9 +224,9 @@ def clean_name(name):
     return stem + suffix
 
 
-# The folders files go in: `f` (kept until --rm) or `<n>d` (deleted by R2 n days after they went up). An album's
-# page goes in `a/` inside its files' folder, so it expires with them.
-PREFIX = r"(?:f|[1-9][0-9]*d)(?:/a)?"
+# The folders files go in: `f` (kept until --rm), `<n>d` (deleted by R2 n days after they went up) or `p<n>d` (the
+# same, in the private bucket). An album's page goes in `a/` inside its files' folder, so it expires with them.
+PREFIX = r"(?:f|p?[1-9][0-9]*d)(?:/a)?"
 # A file that is up: `prefix` is the folder it is in, and `modified` is when it went up.
 Entry = namedtuple("Entry", "prefix ident name size modified")
 # A file to put up: `path` holds its bytes, `name` is its name in the link and `original` the name it had.
@@ -246,8 +249,13 @@ def is_album(prefix):
 
 def expiry_days(prefix):
     """How many days after upload R2 deletes a file in this folder, or None for `f`, which keeps its files."""
-    folder = prefix.split("/")[0]
+    folder = prefix.split("/")[0].lstrip("p")
     return int(folder[:-1]) if folder.endswith("d") else None
+
+
+def is_private(prefix):
+    """Whether a folder, or a key in it, is in the private bucket."""
+    return re.match(r"p[1-9]", prefix) is not None
 
 
 def days_text(days):
@@ -325,13 +333,31 @@ def canonical_query(query):
     return "&".join("%s=%s" % pair for pair in sorted((escape(k), escape(v)) for k, v in query.items()))
 
 
+def scope(stamp, region="auto", service="s3"):
+    return "%s/%s/%s/aws4_request" % (stamp[:8], region, service)
+
+
 def sigv4(method, path, query, headers, payload_hash, key_id, secret, stamp, region="auto", service="s3"):
     """The Authorization header for an AWS Signature Version 4 request, which is how R2's S3 API checks who asks.
 
     `path` is already escaped, `headers` has lower-case names and holds host and x-amz-date, and
     `stamp` is the x-amz-date value, such as 20150830T123600Z.
     """
-    scope = "%s/%s/%s/aws4_request" % (stamp[:8], region, service)
+    return "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s" % (
+        key_id, scope(stamp, region, service), ";".join(sorted(headers)),
+        signature(method, path, query, headers, payload_hash, secret, stamp, region, service))
+
+
+def presign(host, path, key_id, secret, seconds, stamp, region="auto"):
+    """A link that lets anyone GET `path` on `host` for `seconds` after `stamp`, signed in its query string."""
+    query = {"X-Amz-Algorithm": "AWS4-HMAC-SHA256", "X-Amz-Credential": "%s/%s" % (key_id, scope(stamp, region)),
+             "X-Amz-Date": stamp, "X-Amz-Expires": str(seconds), "X-Amz-SignedHeaders": "host"}
+    query["X-Amz-Signature"] = signature("GET", path, query, {"host": host}, "UNSIGNED-PAYLOAD", secret, stamp, region)
+    return "https://%s%s?%s" % (host, path, canonical_query(query))
+
+
+def signature(method, path, query, headers, payload_hash, secret, stamp, region="auto", service="s3"):
+    """The SigV4 signature of a request, as sigv4 describes it."""
     names = sorted(headers)
     canonical = "\n".join([
         method,
@@ -341,12 +367,12 @@ def sigv4(method, path, query, headers, payload_hash, key_id, secret, stamp, reg
         ";".join(names),
         payload_hash,
     ])
-    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()])
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope(stamp, region, service),
+                         hashlib.sha256(canonical.encode()).hexdigest()])
     key = ("AWS4" + secret).encode()
     for part in (stamp[:8], region, service, "aws4_request"):
         key = hmac.new(key, part.encode(), hashlib.sha256).digest()
-    signature = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
-    return "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s" % (key_id, scope, ";".join(names), signature)
+    return hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
 
 
 def gh_login():
@@ -604,17 +630,29 @@ class Site:
 
 
 class Bucket:
-    """A Cloudflare R2 bucket behind your own domain, reached with its S3 API. A file answers the moment its upload ends."""
+    """A Cloudflare R2 bucket behind your own domain, reached with its S3 API. A file answers the moment its upload ends.
+    Private files (`p<n>d/`) go in a second bucket with no domain, where only a presigned link can read them."""
 
     def __init__(self, config):
         self.host = urllib.parse.urlsplit(config["endpoint"]).netloc
-        self.bucket = config["bucket"]
+        self.bucket, self.private = config["bucket"], config.get("private_bucket")
         self.key_id, self.secret = config["access_key_id"], config["secret_access_key"]
         self.base = config["public_url"].rstrip("/") + "/"
         self.zone_id, self.purge_token = config.get("zone_id"), config.get("purge_token")
 
+    def bucket_for(self, key):
+        return self.private if is_private(key) else self.bucket
+
     def url(self, prefix, ident, name):
+        """A file's link; a private file has none that lasts, so it is named by its place in the private bucket."""
+        if is_private(prefix):
+            return "private:%s/%s/%s" % (prefix, ident, urllib.parse.quote(name))
         return link(self.base, prefix, ident, name)
+
+    def presign(self, prefix, ident, name, seconds):
+        """A link to a private file that works for `seconds` from now."""
+        path = "/%s/%s/%s/%s" % (self.private, prefix, ident, urllib.parse.quote(name))
+        return presign(self.host, path, self.key_id, self.secret, seconds, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
 
     def purge(self, urls):
         """Drops these links from Cloudflare's cache. True if it did; a failure only warns, as the files are gone already."""
@@ -633,11 +671,13 @@ class Bucket:
                 return False
         return True
 
-    def request(self, method, key="", query=None, body=None, digest=EMPTY_SHA256, headers=None, tries=3):
-        """One signed request, as (status, body, headers). A 404 comes back. A dropped connection or an error on
-        R2's side is tried again, up to `tries` times in all; any other failure ends the program with R2's reason."""
+    def request(self, method, key="", query=None, body=None, digest=EMPTY_SHA256, headers=None, tries=3, bucket=None):
+        """One signed request, as (status, body, headers), to the bucket `key` is in unless `bucket` says. A 404 comes
+        back. A dropped connection or an error on R2's side is tried again, up to `tries` times in all; any other
+        failure ends the program with R2's reason."""
         query = query or {}
-        path = "/" + self.bucket + ("/" + urllib.parse.quote(key) if key else "")
+        bucket = bucket or self.bucket_for(key)
+        path = "/" + bucket + ("/" + urllib.parse.quote(key) if key else "")
         url = "https://%s%s" % (self.host, path) + ("?" + canonical_query(query) if query else "")
         for attempt in range(1, tries + 1):
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -654,34 +694,38 @@ class Bucket:
                     return 404, b"", error.headers
                 reason = s3_reason(error)
                 if error.code < 500 or attempt == tries:
-                    die("R2 refused %s %s: %s" % (method, key or "the bucket", reason))
+                    die("R2 refused %s %s: %s" % (method, key or bucket, reason))
             except (OSError, http.client.HTTPException) as error:  # URLError, a timeout or a cut in mid-transfer
                 reason = getattr(error, "reason", error)
                 if attempt == tries:
                     die("cannot reach R2 at %s: %s" % (self.host, reason))
-            say("share: %s %s failed (%s); trying again" % (method, key or "the bucket", reason))
+            say("share: %s %s failed (%s); trying again" % (method, key or bucket, reason))
             if hasattr(body, "rewind"):
                 body.rewind()
             time.sleep(2 ** attempt)
 
     def files(self):
-        """Every file that is up, as Entry, in key order."""
-        found, query = [], {"list-type": "2"}
-        while True:
-            status, body, _ = self.request("GET", query=query)
-            if status == 404:
-                die("there is no bucket %s; make it in the Cloudflare dashboard" % self.bucket)
-            root = parse_xml(body)
-            for item in root.iter("Contents"):
-                parts = parse_key(item.findtext("Key"))
-                if parts:
-                    stamp = item.findtext("LastModified") or ""
-                    modified = calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")) if stamp else 0
-                    found.append(Entry(*parts, int(item.findtext("Size")), modified))
-            token = root.findtext("NextContinuationToken")
-            if root.findtext("IsTruncated") != "true" or not token:
-                return found
-            query = dict(query, **{"continuation-token": token})
+        """Every file that is up, in the bucket and then the private one, as Entry, in key order."""
+        found = []
+        for bucket in filter(None, (self.bucket, self.private)):
+            query = {"list-type": "2"}
+            while True:
+                status, body, _ = self.request("GET", query=query, bucket=bucket)
+                if status == 404:
+                    die("there is no bucket %s; make it in the Cloudflare dashboard" % bucket)
+                root = parse_xml(body)
+                for item in root.iter("Contents"):
+                    key = item.findtext("Key")
+                    parts = parse_key(key)
+                    if parts and self.bucket_for(key) == bucket:
+                        stamp = item.findtext("LastModified") or ""
+                        modified = calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S")) if stamp else 0
+                        found.append(Entry(*parts, int(item.findtext("Size")), modified))
+                token = root.findtext("NextContinuationToken")
+                if root.findtext("IsTruncated") != "true" or not token:
+                    break
+                query = dict(query, **{"continuation-token": token})
+        return found
 
     def read(self, entry):
         return self.request("GET", "%s/%s/%s" % (entry.prefix, entry.ident, entry.name))[1]
@@ -707,8 +751,9 @@ class Bucket:
             say("R2 deletes %s about %s, %s from now (it can take up to a day longer)"
                 % (", ".join(item.name for item in new), day(time.time() + days * 86400), days_text(days)))
         # Cloudflare caches a 404 too, so a file shared again after --rm would answer 404 for a few minutes.
-        if self.zone_id and self.purge_token:
-            self.purge([self.url(item.prefix, item.ident, item.name) for item in new])
+        public = [self.url(item.prefix, item.ident, item.name) for item in new if not is_private(item.prefix)]
+        if public and self.zone_id and self.purge_token:
+            self.purge(public)
         return True
 
     @staticmethod
@@ -718,7 +763,7 @@ class Bucket:
     def put(self, item, progress):
         """Puts one file: in one request, or in parts when it is big."""
         headers = {
-            "cache-control": R2_CACHE_CONTROL,
+            "cache-control": "private" if is_private(item.prefix) else R2_CACHE_CONTROL,
             "content-disposition": disposition(item.name, item.original),
             # Only album pages, which share writes itself, are served as pages; every other HTML file is plain text.
             "content-type": "text/html; charset=utf-8" if is_album(item.prefix) else content_type(item.path, item.name),
@@ -771,7 +816,7 @@ class Bucket:
 
     def unfinished(self, key):
         """The id of an unfinished upload of this key and its parts as {number: (etag, size)}, or (None, {})."""
-        root = parse_xml(self.request("GET", query={"uploads": "", "prefix": key})[1])
+        root = parse_xml(self.request("GET", query={"uploads": "", "prefix": key}, bucket=self.bucket_for(key))[1])
         uploads = sorted((u.findtext("Initiated") or "", u.findtext("UploadId"))
                          for u in root.iter("Upload") if u.findtext("Key") == key)
         if not uploads:
@@ -794,7 +839,10 @@ class Bucket:
         for entry in doomed:
             self.request("DELETE", "%s/%s/%s" % (entry.prefix, entry.ident, entry.name))
         say("removed %d file(s)" % len(doomed))
-        if self.zone_id and self.purge_token and self.purge([self.url(e.prefix, e.ident, e.name) for e in doomed]):
+        public = [self.url(e.prefix, e.ident, e.name) for e in doomed if not is_private(e.prefix)]
+        if not public:
+            return
+        if self.zone_id and self.purge_token and self.purge(public):
             say("and purged from Cloudflare's cache; a browser that already opened one may still show it")
         else:
             say("Cloudflare's cache may serve them for up to an hour")
@@ -1204,36 +1252,39 @@ def from_clipboard(folder):
     return [path] if path.stat().st_size else []
 
 
-def expiry_rule(config, days):
-    """Makes sure R2 deletes files in `<days>d/` that many days after they go up. A bucket's lifecycle rules need a
-    token the share settings do not hold, so this asks the Cloudflare CLI, once for each number of days."""
-    if days in config.get("expire_days", []):
+def expiry_rule(config, folder):
+    """Makes sure R2 deletes files in `folder` (`7d`, or `p1d` in the private bucket) as many days after they go up
+    as it says. A bucket's lifecycle rules need a token the share settings do not hold, so this asks the Cloudflare
+    CLI, once for each folder."""
+    days = expiry_days(folder)
+    bucket, field = (config["private_bucket"], "private_expire_days") if is_private(folder) else (config["bucket"], "expire_days")
+    if days in config.get(field, []):
         return
-    prefix = "%dd/" % days
+    prefix = folder + "/"
     by_hand = ("or add it in the dashboard: R2 -> %s -> Settings -> Object Lifecycle Rules, prefix %s, delete "
-               "objects %s after upload; then run this again with SHARE_EXPIRE_RULE_SET=1" % (config["bucket"], prefix, days_text(days)))
+               "objects %s after upload; then run this again with SHARE_EXPIRE_RULE_SET=1" % (bucket, prefix, days_text(days)))
     if os.environ.get("SHARE_EXPIRE_RULE_SET") != "1":
         if not shutil.which("cf"):
-            die("--expire needs a lifecycle rule on the bucket. Install the Cloudflare CLI (cf) and log in, " + by_hand)
-        say("adding a lifecycle rule to %s: delete files in %s %s after upload (once)" % (config["bucket"], prefix, days_text(days)))
+            die("files that expire need a lifecycle rule on the bucket. Install the Cloudflare CLI (cf) and log in, " + by_hand)
+        say("adding a lifecycle rule to %s: delete files in %s %s after upload (once)" % (bucket, prefix, days_text(days)))
         env = dict(os.environ, CLOUDFLARE_ACCOUNT_ID=urllib.parse.urlsplit(config["endpoint"]).netloc.split(".")[0])
         cf = ["cf", "r2", "buckets", "lifecycle"]
-        got = subprocess.run(cf + ["get", config["bucket"], "-q"], capture_output=True, text=True, env=env)
+        got = subprocess.run(cf + ["get", bucket, "-q"], capture_output=True, text=True, env=env)
         try:
             rules = json.loads(got.stdout).get("rules") or []
         except ValueError:
             die("cf could not read the bucket's lifecycle rules: %s\nLog in with `cf auth login`, %s"
                 % ((got.stderr or got.stdout).strip(), by_hand))
-        rule_id = "share-expire-%dd" % days
+        rule_id = "share-expire-" + folder
         rules = [rule for rule in rules if rule.get("id") != rule_id] + [{
             "id": rule_id, "enabled": True, "conditions": {"prefix": prefix},
             "deleteObjectsTransition": {"condition": {"type": "Age", "maxAge": days * 86400}},
         }]
-        put = subprocess.run(cf + ["update", config["bucket"], "--rules", json.dumps(rules), "-f", "-q"],
+        put = subprocess.run(cf + ["update", bucket, "--rules", json.dumps(rules), "-f", "-q"],
                              capture_output=True, text=True, env=env)
         if put.returncode:
             die("cf could not add the lifecycle rule: %s\nInstead, %s" % ((put.stderr or put.stdout).strip(), by_hand))
-    config["expire_days"] = sorted(set(config.get("expire_days", [])) | {days})
+    config[field] = sorted(set(config.get(field, [])) | {days})
     save_config(config)
 
 
@@ -1247,11 +1298,13 @@ def open_store():
     return site
 
 
-def check_live(url):
-    """The content type if the link answers, else None. A few tries, because the CDN can lag a moment behind the build."""
+def check_live(url, method="HEAD"):
+    """The content type if the link answers, else None. A few tries, because the CDN can lag a moment behind the build.
+    A presigned link is signed for GET only, so it is checked with a GET of its first byte."""
     for attempt in range(5):
         try:
-            request = urllib.request.Request(url, method="HEAD", headers=USER_AGENT)
+            headers = dict(USER_AGENT, Range="bytes=0-0") if method == "GET" else USER_AGENT
+            request = urllib.request.Request(url, method=method, headers=headers)
             with urllib.request.urlopen(request, timeout=15) as reply:
                 return reply.headers.get("content-type", "")
         except urllib.error.HTTPError as error:
@@ -1284,17 +1337,22 @@ def finish(links, copy, waiting=False):
     notify(title + ("; it may not work for another minute" if waiting else ""), "\n".join(links))
 
 
-def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata=False, resize=None, album=False):
+def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata=False, resize=None, album=False,
+              private=None):
     """Puts the files up and prints their links. `-` reads one from stdin, and no paths at all shares what is on the
-    clipboard. With `expire`, a number of days, R2 deletes them that long after. `mp4` converts video that browsers
-    may not play, `resize` scales pictures down to that many pixels on their longer side, and pictures and videos
-    lose their metadata unless `keep_metadata`. With `album`, one page shows them all, and its link is the one
-    printed. False if there was nothing to share."""
+    clipboard. With `expire`, a number of days, R2 deletes them that long after. With `private`, a number of
+    seconds, they go in the private bucket, the links stop working that long after, and R2 deletes the files at
+    the end of that day. `mp4` converts video that browsers may not play, `resize` scales pictures down to that
+    many pixels on their longer side, and pictures and videos lose their metadata unless `keep_metadata`. With
+    `album`, one page shows them all, and its link is the one printed. False if there was nothing to share."""
     config = r2_config()
     if expire and not config:
         die("--expire needs Cloudflare R2 (see share --setup); GitHub Pages cannot delete a file on a timer")
+    if private and not (config and config.get("private_bucket")):
+        die("--private needs a second R2 bucket with no custom domain: make one, give the R2 token Object Read & "
+            "Write on it, and name it in share --setup")
     limit, rule = (R2_MAX_BYTES, "R2 takes at most 5 TB") if config else (MAX_BYTES, "GitHub takes at most 100 MB")
-    prefix = "%dd" % expire if expire else "f"
+    prefix = "p%dd" % -(-private // 86400) if private else "%dd" % expire if expire else "f"
     with work_dir() as work:
         work = Path(work)
         sources = [from_stdin(work) if raw == "-" else Path(raw).expanduser() for raw in paths] or from_clipboard(work)
@@ -1341,21 +1399,27 @@ def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata
             page.write_text(album_page(items))
             digest = file_sha256(page)
             items.append(Item(page, prefix + "/a", digest[:10], page.name, digest, page.stat().st_size, page.name))
-        if expire:
-            expiry_rule(config, expire)
+        if expire or private:
+            expiry_rule(config, prefix)
         store = open_store()
         live = store.upload(items, wait)
-    links = [store.url(item.prefix, item.ident, item.name) for item in items]
+    if private:
+        links = [store.presign(item.prefix, item.ident, item.name, private) for item in items]
+        say("the link%s stop working at %s" % ("s" if len(links) > 1 else "",
+                                               time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + private))))
+    else:
+        links = [store.url(item.prefix, item.ident, item.name) for item in items]
     waiting = not live
     if waiting:
         say("share: the build is still running, so the links may not work for another minute")
     elif wait:
-        for each, kind in zip(links, in_parallel(check_live, links)):
+        method = "GET" if private else "HEAD"
+        for item, each, kind in zip(items, links, in_parallel(lambda each: check_live(each, method), links)):
             if kind is None:
                 say("share: %s does not answer yet; try it again in a minute" % each)
                 waiting = True
             else:
-                say("ok  %s  (%s)" % (each.rsplit("/", 1)[-1], kind.split(";")[0]))
+                say("ok  %s  (%s)" % (item.name, kind.split(";")[0]))
     finish(links[-1:] if album else links, copy, waiting)
     return True
 
@@ -1392,7 +1456,7 @@ def cmd_rm(targets, wait, yes=False, older_than=None):
             return
         several, heading = True, "%d file(s) went up more than %s ago:" % (len(doomed), days_text(older_than))
     for target in targets:
-        match = re.search(r"/(%s)/([0-9a-f]{10})/" % PREFIX, target)
+        match = re.search(r"(?:^|[/:])(%s)/([0-9a-f]{10})/" % PREFIX, target)
         if match:
             hits = [e for e in found if (e.prefix, e.ident) == match.groups()]
         else:
@@ -1465,18 +1529,24 @@ def cmd_setup():
     if zone:
         token = getpass.getpass("Cache Purge token (not shown; Enter keeps the saved one): ").strip()
         config["zone_id"], config["purge_token"] = zone, token or old.get("purge_token", "")
+    say("Optional: a second bucket with no custom domain lets --private hand out links that stop working. The R2 "
+        "token needs Object Read & Write on it too.")
+    private = input("Private bucket (Enter %s): " % ("keeps " + old["private_bucket"] if old.get("private_bucket") else "skips")).strip()
+    private = private or old.get("private_bucket", "")
+    if private:
+        config["private_bucket"] = private
     found = Bucket(config).files()  # ends the program with R2's reason if a setting is wrong
-    say("R2 answered: %d file(s) in %s" % (len(found), config["bucket"]))
+    say("R2 answered: %d file(s) in %s" % (len(found), " and ".join(filter(None, (config["bucket"], private)))))
     try:
         urllib.request.urlopen(urllib.request.Request(config["public_url"], method="HEAD", headers=USER_AGENT), timeout=15)
     except urllib.error.HTTPError:
         pass  # any answer means the domain and its certificate work
     except urllib.error.URLError as error:
         say("note: %s does not answer yet (%s); check that the custom domain is Active" % (config["public_url"], error.reason))
-    config["expire_days"] = old.get("expire_days", []) if old.get("endpoint") == config["endpoint"] and \
-        old.get("bucket") == config["bucket"] else []
-    if not config["expire_days"]:
-        del config["expire_days"]
+    # The lifecycle rules already added stay known while the bucket they are on stays the same.
+    for field, bucket in (("expire_days", "bucket"), ("private_expire_days", "private_bucket")):
+        if old.get(field) and old.get("endpoint") == config["endpoint"] and old.get(bucket) == config.get(bucket):
+            config[field] = old[field]
     save_config(config)
     say("saved; `share FILE` now puts files on %s" % config["public_url"])
 
@@ -1486,6 +1556,15 @@ def parse_pixels(text):
     if not re.fullmatch(r"[1-9][0-9]{0,4}", text.strip()):
         raise argparse.ArgumentTypeError("give a number of pixels, such as 2048")
     return int(text)
+
+
+def parse_duration(text):
+    """--private's value, such as 30m, 1h or 2d, in seconds: at most 7 days, the longest a presigned link lasts."""
+    match = re.fullmatch(r"([1-9][0-9]{0,5})([mhd])", text.strip().lower())
+    seconds = int(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)] if match else 0
+    if not 0 < seconds <= PRIVATE_MAX_SECONDS:
+        raise argparse.ArgumentTypeError("give a time of at most 7d, such as 30m, 1h or 2d")
+    return seconds
 
 
 def parse_days(text):
@@ -1510,6 +1589,9 @@ def main():
     parser.add_argument("--setup", action="store_true", help="store Cloudflare R2 settings; from then on files go there")
     parser.add_argument("--expire", metavar="DAYS", type=parse_days,
                         help="R2 deletes the files this many days after upload, such as 7d (R2 only)")
+    parser.add_argument("--private", metavar="TIME", type=parse_duration,
+                        help="put the files in the private bucket and print links that stop working after TIME, "
+                             "such as 30m, 1h or 2d, at most 7d (R2 only)")
     parser.add_argument("--mp4", action="store_true", help="convert video that browsers may not play inline to mp4")
     parser.add_argument("--resize", metavar="PIXELS", type=parse_pixels,
                         help="scale JPEG and PNG pictures down to this many pixels on their longer side, such as 2048")
@@ -1527,6 +1609,10 @@ def main():
         parser.error("--rm needs a link, an id or a file name, or --older-than")
     if args.resize and args.keep_metadata:
         parser.error("--resize drops a picture's metadata, so it does not go with --keep-metadata")
+    if args.private and args.expire:
+        parser.error("--private sets when its files go, so it does not go with --expire")
+    if args.private and args.album:
+        parser.error("an album's page is public, so --album does not go with --private")
     if args.setup:
         cmd_setup()
     elif args.list:
@@ -1534,7 +1620,7 @@ def main():
     elif args.rm is not None:
         cmd_rm(args.rm, not args.no_wait, args.yes, args.older_than)
     elif not cmd_share(args.paths, not args.no_wait, not args.no_copy, args.expire, args.mp4, args.keep_metadata,
-                       args.resize, args.album):
+                       args.resize, args.album, args.private):
         parser.print_help()
 
 

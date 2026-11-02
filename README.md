@@ -9,6 +9,7 @@ share easel-teaser.mp4 hero.png     # upload, wait until the links work, print o
 share                               # share the screenshot, or the files, on the clipboard
 grim - | share -                    # share what is piped in
 share --expire 7d clip.mp4          # R2 deletes it 7 days from now
+share --private 1h scan.pdf         # a link that stops working in an hour
 share --mp4 phone.mov               # convert video browsers may not play to mp4 first
 share --resize 2048 photo.jpg       # scale a big photo down to 2048 pixels on its longer side
 share --album a.jpg b.jpg clip.mp4  # one link to a page that shows them all
@@ -67,6 +68,10 @@ change bucket settings. Without `cf`, add it in the dashboard instead: **the buc
 Object Lifecycle Rules → Add rule**, prefix `7d/`, delete objects 7 days after upload. Then run
 `SHARE_EXPIRE_RULE_SET=1 share --expire 7d FILE` once, so `share` records that the rule is there.
 
+For `--private`, make a second bucket with no custom domain, such as `share-private`, and leave its
+public r2.dev address off. Give the share token **Object Read & Write** on it too (**R2 object
+storage → API Tokens → the token → Edit**, add the bucket), then name the bucket in `share --setup`.
+
 Optionally, so that `--rm` takes a link down at once, make one more token: **Manage Account →
 Account API Tokens → Create Token**, with **Zone → Cache Purge** on your domain's zone. Give it and
 the zone's ID (on the domain's Overview page) to `share --setup`.
@@ -91,6 +96,16 @@ in the browser. The id is the start of the SHA-256 of the bytes that go up, afte
 converting, so the same file always gets the same link. Files shared with `--expire 7d` go in
 `7d/` rather than `f/`, and a lifecycle rule on the bucket deletes what is in `7d/` seven days
 after upload. R2 may take up to a day longer.
+
+**Private links.** `--private 1h` puts files in the second bucket, in `p1d/` (the time rounded up
+to whole days), and prints a presigned link: one signed in its query string with your R2 key, which
+R2 answers for that long and then refuses. A link lasts at most 7 days, R2's limit. The bucket has no
+custom domain, so nothing in it can be read without such a link; a folder in the main bucket would
+not do, because its custom domain serves every key and a presigned link shows the key. A lifecycle
+rule deletes `p1d/` a day after upload, added once with `cf` as for `--expire`. The link is on
+`<account>.r2.cloudflarestorage.com`, not your domain, because Cloudflare does not take presigned
+links on custom domains. `--list` shows private files as `private:p1d/<id>/<name>`, and `--rm` takes
+that, the id, the name or the link.
 
 **Before an upload.** A copy of each picture or video is made in `~/.cache/share/` and deleted
 when `share` ends. `exiftool` strips a picture when it is installed, keeping only the orientation
