@@ -1405,8 +1405,8 @@ def cmd_share(paths, wait=True, copy=True, expire=None, mp4=False, keep_metadata
         live = store.upload(items, wait)
     if private:
         links = [store.presign(item.prefix, item.ident, item.name, private) for item in items]
-        say("the link%s stop working at %s" % ("s" if len(links) > 1 else "",
-                                               time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + private))))
+        say("%s working at %s" % ("the links stop" if len(links) > 1 else "the link stops",
+                                  time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + private))))
     else:
         links = [store.url(item.prefix, item.ident, item.name) for item in items]
     waiting = not live

@@ -688,12 +688,17 @@ class Private(unittest.TestCase):
             path.write_text("hello")
             store = mock.Mock(**{"upload.return_value": True})
             store.presign.side_effect = lambda prefix, ident, name, seconds: "https://s3/%s/%s/%s?sig&%d" % (prefix, ident, name, seconds)
-            with mock.patch.object(share, "open_store", return_value=store), mock.patch.object(share, "say"), \
+            with mock.patch.object(share, "open_store", return_value=store), mock.patch.object(share, "say") as say, \
                     mock.patch.object(share, "expiry_rule") as rule, \
                     mock.patch.object(share, "check_live", return_value="text/plain") as live, \
                     mock.patch.object(share, "finish") as finish:
                 share.cmd_share([str(path)], wait=True, copy=False, private=seconds)
+        self.said = [call.args[0] for call in say.call_args_list]
         return store.upload.call_args.args[0][0], rule.call_args.args[1], live.call_args.args, finish.call_args.args[0]
+
+    def test_it_says_when_the_link_stops_working(self):
+        self.shared(3600, self.PRIVATE)
+        self.assertTrue(any(line.startswith("the link stops working at ") for line in self.said), self.said)
 
     def test_share_puts_files_in_the_folder_for_their_day_and_prints_presigned_links(self):
         item, folder, checked, links = self.shared(3600, self.PRIVATE)
