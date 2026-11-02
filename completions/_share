@@ -1,0 +1,8 @@
+#compdef share
+# The flags and their help come from `share --help`, so a new flag completes without a change here. --rm's
+# targets live on R2 or GitHub, so nothing completes after it.
+_arguments \
+  '--expire=[R2 deletes the files this many days after upload]:days:(1d 7d 30d)' \
+  '--rm=[take files down: a link, an id or a file name]:target: ' \
+  '*:file:_files' \
+  --

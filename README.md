@@ -29,6 +29,17 @@ git clone git@github.com:astrosteveo/share-cli.git ~/Projects/share-cli
 ln -sf ~/Projects/share-cli/share ~/.local/bin/share
 ```
 
+For zsh completion of the flags, `--expire`'s days and file names, link `completions/_share` into a
+folder on `$fpath` and start a new shell. With oh-my-zsh, `$ZSH_CUSTOM/completions` is on it:
+
+```sh
+mkdir -p $ZSH_CUSTOM/completions && ln -sf ~/Projects/share-cli/completions/_share $ZSH_CUSTOM/completions/
+```
+
+Without oh-my-zsh, use a folder of your own, such as `~/.zfunc`, and add `fpath=(~/.zfunc $fpath)` to
+`~/.zshrc` before `compinit`. The completion reads the flags from `share --help`, so a new flag
+completes without a change to it.
+
 Then set up one of the two places files go. Edit `share` in the repo and the command changes with
 it. On Wayland, `wl-copy` puts the links on the clipboard. Bound to a desktop hotkey, where there is
 no terminal to read, `share` says how it went in a notification (`notify-send`, from `libnotify`):

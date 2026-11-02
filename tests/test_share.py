@@ -7,7 +7,10 @@ import importlib.util
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -920,6 +923,24 @@ class Mp4(unittest.TestCase):
         self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv420p")
         self.assertIn("scale=trunc(iw/2)*2:trunc(ih/2)*2", command)
         self.assertEqual(command[command.index("-c:a") + 1], "copy")
+
+
+class ZshCompletion(unittest.TestCase):
+    """completions/_share reads most flags from `share --help`, and names a few itself to complete their values."""
+
+    SPEC = ROOT / "completions" / "_share"
+
+    def test_every_flag_it_names_is_one_share_has(self):
+        named = set(re.findall(r"'(--[a-z-]+)", self.SPEC.read_text()))
+        shown = subprocess.run([sys.executable, str(ROOT / "share"), "--help"], capture_output=True, text=True).stdout
+        self.assertTrue(named)
+        for flag in named:
+            self.assertRegex(shown, r"(?m)^  .*%s\b" % re.escape(flag))
+
+    @unittest.skipUnless(shutil.which("zsh"), "needs zsh")
+    def test_zsh_reads_it(self):
+        done = subprocess.run(["zsh", "-n", str(self.SPEC)], capture_output=True, text=True)
+        self.assertEqual((done.returncode, done.stderr), (0, ""))
 
 
 class Workflow(unittest.TestCase):
